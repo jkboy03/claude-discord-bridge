@@ -1,0 +1,26 @@
+[Unit]
+# claude-discord bridge — systemd --user service template.
+#
+# Replace __INSTALL_DIR__ with the absolute path to your checkout, e.g.:
+#   sed "s|__INSTALL_DIR__|$PWD|g" claude-discord-bridge.service \
+#     > ~/.config/systemd/user/claude-discord-bridge.service
+#
+# Then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now claude-discord-bridge.service
+Description=Claude Code <-> Discord DM bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__INSTALL_DIR__
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__INSTALL_DIR__/venv/bin/python __INSTALL_DIR__/bot.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
