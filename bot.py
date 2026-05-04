@@ -100,6 +100,54 @@ async def _deny(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("not authorized", ephemeral=True)
 
 
+def _read_claude_defaults() -> tuple[str | None, str | None]:
+    """Read ~/.claude/settings.json for the user's configured default model
+    and effortLevel. Returns (model, effort), either may be None if unset.
+    Re-read each call so live edits via Claude Code's `/config` are picked up.
+    """
+    settings = Path.home() / ".claude" / "settings.json"
+    if not settings.is_file():
+        return (None, None)
+    try:
+        data = json.loads(settings.read_text())
+    except (OSError, json.JSONDecodeError):
+        return (None, None)
+    return (data.get("model") or None, data.get("effortLevel") or None)
+
+
+def _status_block() -> str:
+    """Render the /status output. Resolves (default) values to the real
+    underlying setting where we can read it, so the user sees what Claude
+    Code will actually use, not just the word 'default'.
+    """
+    cfg_model, cfg_effort = _read_claude_defaults()
+    if state.model:
+        model_line = state.model
+    elif cfg_model:
+        model_line = f"{cfg_model}  (default — from ~/.claude/settings.json)"
+    else:
+        model_line = "(default — Claude Code's built-in choice)"
+    if state.effort:
+        effort_line = state.effort
+    elif cfg_effort:
+        effort_line = f"{cfg_effort}  (default — from ~/.claude/settings.json)"
+    else:
+        effort_line = "(default — Claude Code's built-in choice)"
+    auto_on = state.permission_mode == "bypassPermissions"
+    auto_line = "ON  (bypassPermissions — tools run without confirmation)" if auto_on \
+        else "OFF (permissions enforced — but headless can't prompt, so tools needing approval will fail)"
+    session_line = state.session_id or "(none — next prompt starts a fresh session)"
+    return (
+        "```\n"
+        f"session:    {session_line}\n"
+        f"model:      {model_line}\n"
+        f"effort:     {effort_line}\n"
+        f"auto_mode:  {auto_line}\n"
+        f"show_tools: {'on' if state.show_tools else 'off'}\n"
+        "```"
+    )
+
+
 HELP_TEXT = (
     "**claude-discord bridge** — your DMs are sent to Claude Code via headless mode.\n"
     "```\n"
@@ -334,16 +382,7 @@ async def slash_tools(interaction: discord.Interaction, mode: app_commands.Choic
 async def slash_status(interaction: discord.Interaction):
     if not _is_authorized(interaction.user.id):
         return await _deny(interaction)
-    await interaction.response.send_message(
-        "```\n"
-        f"session_id:      {state.session_id or '(none — fresh on next turn)'}\n"
-        f"model:           {state.model or '(default)'}\n"
-        f"effort:          {state.effort or '(default)'}\n"
-        f"permission_mode: {state.permission_mode}\n"
-        f"show_tools:      {state.show_tools}\n"
-        "```",
-        ephemeral=True,
-    )
+    await interaction.response.send_message(_status_block(), ephemeral=True)
 
 
 @tree.command(name="help", description="Show bridge command help")
@@ -393,15 +432,7 @@ async def _handle(channel, content: str) -> None:
         await channel.send(HELP_TEXT)
         return
     if cmd in ("/status",):
-        await channel.send(
-            "```\n"
-            f"session_id:      {state.session_id or '(none — fresh on next turn)'}\n"
-            f"model:           {state.model or '(default)'}\n"
-            f"effort:          {state.effort or '(default)'}\n"
-            f"permission_mode: {state.permission_mode}\n"
-            f"show_tools:      {state.show_tools}\n"
-            "```"
-        )
+        await channel.send(_status_block())
         return
     if cmd in ("/new",):
         state.session_id = None
