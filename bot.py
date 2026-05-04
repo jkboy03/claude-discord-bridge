@@ -148,7 +148,10 @@ def split_at_boundary(text: str, max_size: int = DISCORD_LIMIT) -> list[str]:
 
 async def send_text(channel, text: str) -> None:
     """Send text as plain Discord markdown, paragraph-aware chunked."""
-    for chunk in split_at_boundary(text):
+    chunks = split_at_boundary(text)
+    for i, chunk in enumerate(chunks):
+        if i > 0:
+            await asyncio.sleep(0.4)
         await channel.send(chunk)
 
 
