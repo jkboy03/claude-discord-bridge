@@ -4,16 +4,17 @@ DMs from the allowlisted Discord user are run through `claude -p` (Claude
 Code's headless mode). Output comes back as structured JSON events with no
 TUI chrome — assistant text is posted to Discord as plain markdown.
 
-Bot-level commands (prefixed with `!`):
-  !new          start a fresh session (drop saved session_id)
-  !auto on/off  toggle bypassPermissions (default: on)
-  !model <name> switch model for next turn (e.g. opus, sonnet, haiku)
-  !effort <lvl> low/medium/high/xhigh/max
-  !status       show session/model/permission state
-  !help         this message
+Bot-level commands (use Discord's slash UI, or `!cmd` text form):
+  /new          start a fresh session (drop saved session_id)
+  /auto on/off  toggle bypassPermissions (default: on)
+  /model <name> switch model for next turn (e.g. opus, sonnet, haiku)
+  /effort <lvl> low/medium/high/xhigh/max
+  /tools on/off show tool-call notifications inline
+  /status       show session/model/permission state
+  /help         this message
 
-Anything else is sent to claude as a prompt. Claude Code slash commands
-(like /init, /review, /security-review) work as prompts directly.
+Anything else is sent to claude as a prompt. Claude Code's own slash
+commands (like /init, /review, /security-review) pass through as prompts.
 """
 
 from __future__ import annotations
@@ -102,14 +103,18 @@ async def _deny(interaction: discord.Interaction) -> None:
 HELP_TEXT = (
     "**claude-discord bridge** — your DMs are sent to Claude Code via headless mode.\n"
     "```\n"
-    "Plain text       Sent as a prompt. Slash commands like /init, /review work.\n"
-    "!new             Start a fresh session (forget prior context).\n"
-    "!auto on|off     Toggle auto-mode (bypassPermissions). Default: on.\n"
-    "!model <name>    Switch model: opus / sonnet / haiku / <full-name>.\n"
-    "!effort <level>  low / medium / high / xhigh / max.\n"
-    "!tools on|off    Show tool-call notifications. Default: off.\n"
-    "!status          Show current session/model/mode.\n"
-    "!help            This message.\n"
+    "Plain text       Sent as a prompt. Claude Code's own /init, /review,\n"
+    "                 /security-review etc. pass through as prompts.\n"
+    "/new             Start a fresh session (forget prior context).\n"
+    "/auto on|off     Toggle auto-mode (bypassPermissions). Default: on.\n"
+    "/model <name>    Switch model: opus / sonnet / haiku / <full-name>.\n"
+    "/effort <level>  low / medium / high / xhigh / max.\n"
+    "/tools on|off    Show tool-call notifications. Default: off.\n"
+    "/status          Show current session/model/mode.\n"
+    "/help            This message.\n"
+    "\n"
+    "Tip: use Discord's slash-command UI for autocomplete + parameter\n"
+    "hints. The legacy `!cmd` text form still works if you prefer typing.\n"
     "```"
 )
 
