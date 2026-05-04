@@ -126,13 +126,13 @@ def _status_block() -> str:
     elif cfg_model:
         model_line = f"{cfg_model}  (default — from ~/.claude/settings.json)"
     else:
-        model_line = "(default — Claude Code's built-in choice)"
+        model_line = "(unset — Claude Code uses its built-in default; pin one with /model or in ~/.claude/settings.json)"
     if state.effort:
         effort_line = state.effort
     elif cfg_effort:
         effort_line = f"{cfg_effort}  (default — from ~/.claude/settings.json)"
     else:
-        effort_line = "(default — Claude Code's built-in choice)"
+        effort_line = "(unset — Claude Code uses its built-in default; pin one with /effort or in ~/.claude/settings.json)"
     auto_on = state.permission_mode == "bypassPermissions"
     auto_line = "ON  (bypassPermissions — tools run without confirmation)" if auto_on \
         else "OFF (permissions enforced — but headless can't prompt, so tools needing approval will fail)"
