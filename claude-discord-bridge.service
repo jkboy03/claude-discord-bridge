@@ -16,6 +16,11 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=__INSTALL_DIR__
 Environment=PYTHONUNBUFFERED=1
+# Include ~/.local/bin so a user-scoped `claude` install is on PATH under
+# systemd (the systemd-user default PATH does not include it). If your
+# `claude` lives elsewhere, set BRIDGE_CLAUDE_BIN in .env to the absolute
+# path instead.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=__INSTALL_DIR__/venv/bin/python __INSTALL_DIR__/bot.py
 Restart=on-failure
 RestartSec=5
