@@ -31,3 +31,10 @@ Thumbs.db
 # --- Local archive (in-development scratch) ---
 bot_tmux_archive.py
 tmux_driver.py
+
+# --- Test / coverage artifacts ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
