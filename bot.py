@@ -52,6 +52,12 @@ if not CLAUDE_BIN or not Path(CLAUDE_BIN).exists():
     )
     sys.exit(1)
 DISCORD_LIMIT = 1900  # leave headroom under 2000-char limit
+# claude -p --output-format stream-json emits one JSON object per line. Tool
+# results (large Read outputs, WebFetch payloads, etc.) routinely blow past
+# asyncio's default 64KB StreamReader buffer, which raises
+# `ValueError: Separator is not found, and chunk exceed the limit` and kills
+# the whole turn. 16 MB covers anything Claude Code reasonably emits.
+STREAM_BUFFER_LIMIT = 16 * 1024 * 1024
 
 
 class SessionState:
@@ -63,6 +69,12 @@ class SessionState:
         self.effort: str | None = None  # None = use default
         self.permission_mode: str = "bypassPermissions"  # auto-mode by default
         self.show_tools: bool = False  # toggle to show tool-call notifications
+        # Context-window telemetry: snapshot of the most recent assistant
+        # message's `usage` payload (input + cache tokens = effective context).
+        self.last_usage: dict | None = None
+        self.last_active_model: str | None = None  # actual model from init event
+        # Live subprocess so /stop can interrupt mid-turn from outside the lock.
+        self.current_proc: asyncio.subprocess.Process | None = None
 
     def claude_args(self, prompt: str) -> list[str]:
         args = [
@@ -115,6 +127,76 @@ def _read_claude_defaults() -> tuple[str | None, str | None]:
     return (data.get("model") or None, data.get("effortLevel") or None)
 
 
+# Per-model context window. Keep conservative defaults; override here when
+# new models ship or beta longer-context tiers stabilize.
+CONTEXT_WINDOWS: dict[str, int] = {
+    "claude-opus-4-7": 200_000,
+    "claude-opus-4-6": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-haiku-4-5": 200_000,
+}
+DEFAULT_CONTEXT_WINDOW = 200_000
+
+
+def _context_window_for(model: str | None) -> int:
+    if not model:
+        return DEFAULT_CONTEXT_WINDOW
+    if model in CONTEXT_WINDOWS:
+        return CONTEXT_WINDOWS[model]
+    # Match aliases ("opus", "sonnet", "haiku") and partials.
+    for key, win in CONTEXT_WINDOWS.items():
+        if model in key or key.startswith(f"claude-{model}-"):
+            return win
+    return DEFAULT_CONTEXT_WINDOW
+
+
+def _context_summary() -> tuple[str, float | None]:
+    """Returns (one-line context summary, percent_used or None)."""
+    if not state.last_usage:
+        return ("(no usage yet — send a prompt first)", None)
+    u = state.last_usage
+    used = (
+        int(u.get("input_tokens", 0) or 0)
+        + int(u.get("cache_creation_input_tokens", 0) or 0)
+        + int(u.get("cache_read_input_tokens", 0) or 0)
+    )
+    window = _context_window_for(state.last_active_model or state.model)
+    pct = (used / window * 100) if window else 0.0
+    return (f"{used:,} / {window:,} tokens ({pct:.1f}%)", pct)
+
+
+def _context_block() -> str:
+    if not state.last_usage:
+        return (
+            "_no usage recorded yet — send a prompt first, then `/context` "
+            "shows the context-window breakdown_"
+        )
+    u = state.last_usage
+    inp = int(u.get("input_tokens", 0) or 0)
+    cache_create = int(u.get("cache_creation_input_tokens", 0) or 0)
+    cache_read = int(u.get("cache_read_input_tokens", 0) or 0)
+    output = int(u.get("output_tokens", 0) or 0)
+    used = inp + cache_create + cache_read
+    model = state.last_active_model or state.model or "(unknown)"
+    window = _context_window_for(state.last_active_model or state.model)
+    pct = (used / window * 100) if window else 0.0
+    free = max(window - used, 0)
+    return (
+        "```\n"
+        f"model:           {model}\n"
+        f"context used:    {used:,} / {window:,}  ({pct:.1f}%)\n"
+        f"context free:    {free:,}\n"
+        f"  input:         {inp:,}\n"
+        f"  cache create:  {cache_create:,}\n"
+        f"  cache read:    {cache_read:,}\n"
+        f"output (turn):   {output:,}\n"
+        "```"
+        "_note: this is the headless `usage` payload, not the TUI's_ "
+        "_/context breakdown — system prompt + tool defs are bundled into `input`._"
+    )
+
+
 def _status_block() -> str:
     """Render the /status output. Resolves (default) values to the real
     underlying setting where we can read it, so the user sees what Claude
@@ -137,6 +219,12 @@ def _status_block() -> str:
     auto_line = "ON  (bypassPermissions — tools run without confirmation)" if auto_on \
         else "OFF (permissions enforced — but headless can't prompt, so tools needing approval will fail)"
     session_line = state.session_id or "(none — next prompt starts a fresh session)"
+    ctx_line, _ = _context_summary()
+    running_line = (
+        "yes — send /stop to abort"
+        if (state.current_proc is not None and state.current_proc.returncode is None)
+        else "no"
+    )
     return (
         "```\n"
         f"session:    {session_line}\n"
@@ -144,6 +232,8 @@ def _status_block() -> str:
         f"effort:     {effort_line}\n"
         f"auto_mode:  {auto_line}\n"
         f"show_tools: {'on' if state.show_tools else 'off'}\n"
+        f"context:    {ctx_line}\n"
+        f"running:    {running_line}\n"
         "```"
     )
 
@@ -154,12 +244,21 @@ HELP_TEXT = (
     "Plain text       Sent as a prompt. Claude Code's own /init, /review,\n"
     "                 /security-review etc. pass through as prompts.\n"
     "/new             Start a fresh session (forget prior context).\n"
+    "/stop            Abort the currently running turn (works mid-stream).\n"
+    "/context         Show context-window usage from the last turn.\n"
     "/auto on|off     Toggle auto-mode (bypassPermissions). Default: on.\n"
     "/model <name>    Switch model: opus / sonnet / haiku / <full-name>.\n"
     "/effort <level>  low / medium / high / xhigh / max.\n"
     "/tools on|off    Show tool-call notifications. Default: off.\n"
-    "/status          Show current session/model/mode.\n"
+    "/status          Show session/model/mode + context %.\n"
     "/help            This message.\n"
+    "\n"
+    "Steering: Claude Code has no /steer command. Closest equivalent is\n"
+    "/stop the current turn, then DM a new prompt — the session resumes\n"
+    "with your redirect on top of the prior context.\n"
+    "\n"
+    "/exit and /quit are intentionally no-ops in the bridge so a typo\n"
+    "can't kill the bot or any running claude session.\n"
     "\n"
     "Tip: use Discord's slash-command UI for autocomplete + parameter\n"
     "hints. The legacy `!cmd` text form still works if you prefer typing.\n"
@@ -232,14 +331,35 @@ async def run_claude_turn(channel, prompt: str) -> None:
         cwd=WORKDIR,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=STREAM_BUFFER_LIMIT,
     )
+    state.current_proc = proc
 
     last_session_id: str | None = None
     error_payload: str | None = None
+    stopped_by_user = False
 
     async with channel.typing():
         assert proc.stdout is not None
-        async for line_bytes in proc.stdout:
+        while True:
+            try:
+                line_bytes = await proc.stdout.readline()
+            except asyncio.LimitOverrunError as e:
+                # Single event exceeded STREAM_BUFFER_LIMIT. Drain past the
+                # newline so we can keep reading subsequent events instead of
+                # crashing the turn.
+                await proc.stdout.readexactly(e.consumed)
+                try:
+                    await proc.stdout.readuntil(b"\n")
+                except (asyncio.LimitOverrunError, asyncio.IncompleteReadError):
+                    pass
+                await channel.send(
+                    f"_⚠ skipped one stream-json event larger than "
+                    f"{STREAM_BUFFER_LIMIT // (1024 * 1024)} MB_"
+                )
+                continue
+            if not line_bytes:
+                break
             try:
                 event = json.loads(line_bytes.decode().strip())
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -250,10 +370,21 @@ async def run_claude_turn(channel, prompt: str) -> None:
             # Track session id for resume on next turn.
             if etype == "system" and event.get("subtype") == "init":
                 last_session_id = event.get("session_id") or last_session_id
+                # Authoritative model name from the runtime — used for context %.
+                m = event.get("model")
+                if m:
+                    state.last_active_model = m
 
             # Assistant turn complete (one per turn — tools cause multiple turns).
             elif etype == "assistant":
                 msg = event.get("message", {})
+                # Snapshot usage so /context + /status reflect the latest API call.
+                u = msg.get("usage")
+                if isinstance(u, dict):
+                    state.last_usage = u
+                m = msg.get("model")
+                if m:
+                    state.last_active_model = m
                 for block in msg.get("content", []) or []:
                     btype = block.get("type")
                     if btype == "text":
@@ -278,10 +409,18 @@ async def run_claude_turn(channel, prompt: str) -> None:
         except asyncio.TimeoutError:
             pass
     await proc.wait()
+    # /stop sets this flag via terminate/kill — clear it here so the post-mortem
+    # below recognizes the negative returncode as intentional, not a crash.
+    if proc.returncode is not None and proc.returncode < 0:
+        stopped_by_user = True
+    state.current_proc = None
 
     if last_session_id:
         state.session_id = last_session_id
 
+    if stopped_by_user:
+        # /stop already echoed an ack; suppress the "exited with code -15" noise.
+        return
     if proc.returncode != 0 and error_payload is None:
         tail = stderr_data.decode(errors="replace").strip().splitlines()[-3:]
         error_payload = "claude exited with code {} — {}".format(
@@ -378,11 +517,26 @@ async def slash_tools(interaction: discord.Interaction, mode: app_commands.Choic
     )
 
 
-@tree.command(name="status", description="Show session, model, and mode state")
+@tree.command(name="status", description="Show session, model, mode, and context %")
 async def slash_status(interaction: discord.Interaction):
     if not _is_authorized(interaction.user.id):
         return await _deny(interaction)
     await interaction.response.send_message(_status_block(), ephemeral=True)
+
+
+@tree.command(name="context", description="Show context-window usage from the last turn")
+async def slash_context(interaction: discord.Interaction):
+    if not _is_authorized(interaction.user.id):
+        return await _deny(interaction)
+    await interaction.response.send_message(_context_block(), ephemeral=True)
+
+
+@tree.command(name="stop", description="Abort the currently running Claude turn")
+async def slash_stop(interaction: discord.Interaction):
+    if not _is_authorized(interaction.user.id):
+        return await _deny(interaction)
+    msg = await _do_stop()
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @tree.command(name="help", description="Show bridge command help")
@@ -390,6 +544,24 @@ async def slash_help(interaction: discord.Interaction):
     if not _is_authorized(interaction.user.id):
         return await _deny(interaction)
     await interaction.response.send_message(HELP_TEXT, ephemeral=True)
+
+
+async def _do_stop() -> str:
+    """Terminate the live Claude subprocess, if any. Safe to call from outside
+    the per-user lock — that is the whole point: /stop must work mid-turn."""
+    proc = state.current_proc
+    if proc is None or proc.returncode is not None:
+        return "_no turn running_"
+    try:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        return "_stopped — session preserved, send a new prompt to continue_"
+    except ProcessLookupError:
+        return "_turn already finished_"
 
 
 @client.event
@@ -403,6 +575,23 @@ async def on_message(message: discord.Message) -> None:
 
     content = message.content
     channel = message.channel
+
+    # Pre-lock interceptors. /stop MUST be processed without waiting on the
+    # per-user lock (the lock is held by the running turn it's trying to abort).
+    # /exit + /quit are no-oped here so a typo can't kill the bot or the
+    # session — would be catastrophic mid-task.
+    stripped = content.strip()
+    pre = stripped[1:] if stripped.startswith(("!", "/")) else ""
+    pre_cmd = pre.split(maxsplit=1)[0].lower() if pre else ""
+    if pre_cmd == "stop":
+        await channel.send(await _do_stop())
+        return
+    if pre_cmd in ("exit", "quit"):
+        await channel.send(
+            "_/exit and /quit are no-ops in the bridge — they won't kill the "
+            "bot or any claude session. use /stop to abort the current turn._"
+        )
+        return
 
     async with _lock:
         try:
@@ -433,6 +622,9 @@ async def _handle(channel, content: str) -> None:
         return
     if cmd in ("/status",):
         await channel.send(_status_block())
+        return
+    if cmd in ("/context",):
+        await channel.send(_context_block())
         return
     if cmd in ("/new",):
         state.session_id = None
