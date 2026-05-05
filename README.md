@@ -1,5 +1,9 @@
 # Claude Discord Bridge
 
+[![CI](https://github.com/jkboy03/claude-discord-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/jkboy03/claude-discord-bridge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python: 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
 Use [Claude Code](https://claude.com/claude-code) from anywhere via Discord DMs. Send a message to your bot from your phone, your laptop, or any device with Discord — Claude Code runs on your home machine and replies in the same DM.
 
 > **What this is:** a small Python service that wraps Claude Code's headless mode (`claude -p`) behind a Discord bot. Your DMs become Claude Code prompts. Claude's responses come back as plain Discord messages.
@@ -23,7 +27,9 @@ Use [Claude Code](https://claude.com/claude-code) from anywhere via Discord DMs.
 11. [Usage](#usage)
 12. [Troubleshooting](#troubleshooting)
 13. [Security notes](#security-notes)
-14. [License](#license)
+14. [Development & testing](#development--testing)
+15. [Contributing](#contributing)
+16. [License](#license)
 
 ---
 
@@ -403,6 +409,41 @@ The threat model is: **the bot has the same level of access to your machine as C
 - **Your `.env` file** holds the token. `chmod 600 .env`. Don't commit it (`.gitignore` is set up to exclude it).
 - **The host machine** trusts whoever can DM Claude. Don't run the bridge on a multi-tenant box where others could plausibly pivot through.
 - **Audit log**: `journalctl --user -u claude-discord-bridge` keeps a full record of every prompt and response. Useful for forensics if you ever suspect a problem.
+
+For responsible disclosure of security issues, see [SECURITY.md](SECURITY.md) — please email rather than file a public issue.
+
+---
+
+## Development & testing
+
+The bridge ships with a comprehensive test suite (~120 tests, 96% line coverage) that runs in seconds without needing a real Discord token, a working `claude` install, or any network access.
+
+```bash
+# One-time: install dev dependencies inside the venv
+pip install pytest pytest-asyncio pytest-cov ruff
+
+# Run everything
+pytest --cov=bot --cov-report=term-missing
+
+# Lint
+ruff check bot.py tests/
+```
+
+What the suite covers:
+
+- **Pure functions** — message chunking, tool-call formatting, model→context-window mapping, claude argv construction, settings.json parsing, status/context block rendering.
+- **Authorization** — every slash command and the `on_message` handler reject unauthorized users, bots, and guild messages without mutating state.
+- **Pre-lock interception** — `/stop`, `/exit`, `/quit` all work even when the per-user lock is held by a running turn (`/exit` + `/quit` are intentional no-ops; `/stop` terminates the live `claude` subprocess). These are the bot's safety boundary and have dedicated tests with deadlock-detection timeouts.
+- **Subprocess streaming** — every `stream-json` event type, the 16 MB `StreamReader` buffer trap (with oversize-event drain + recovery), invalid JSON skip, terminate→kill fallback, stopped-vs-crashed post-mortem distinction, stderr-read timeout.
+- **End-to-end** — DM → lock → `_handle` → `run_claude_turn` (mocked subprocess) round-trip with state assertions.
+
+CI runs on every push and PR against Python 3.10 / 3.11 / 3.12 with a 90% coverage gate. PRs cannot merge with a red build.
+
+---
+
+## Contributing
+
+PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow. Short version: open an issue first for non-trivial changes, write a test that fails without your fix, run `pytest` + `ruff` locally, then PR with a clear description.
 
 ---
 
