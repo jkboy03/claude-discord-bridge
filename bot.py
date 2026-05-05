@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -42,6 +43,7 @@ if not USER_ID_RAW.isdigit():
 ALLOWED_USER_ID = int(USER_ID_RAW)
 
 WORKDIR = (os.environ.get("BRIDGE_WORKDIR") or str(Path.home())).rstrip("/")
+ATTACHMENT_DIR = Path(os.environ.get("BRIDGE_ATTACHMENT_DIR") or (Path.home() / ".claude-discord-bridge" / "attachments"))
 CLAUDE_BIN = os.environ.get("BRIDGE_CLAUDE_BIN") or shutil.which("claude") or ""
 if not CLAUDE_BIN or not Path(CLAUDE_BIN).exists():
     print(
@@ -51,6 +53,13 @@ if not CLAUDE_BIN or not Path(CLAUDE_BIN).exists():
     )
     sys.exit(1)
 DISCORD_LIMIT = 1900  # leave headroom under 2000-char limit
+CLAUDE_STDOUT_LIMIT = 10 * 1024 * 1024  # image/tool JSON events can exceed asyncio's 64KB default
+DISCORD_FILE_LIMIT = 24 * 1024 * 1024  # stay under common 25MB upload cap
+SENDABLE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".txt", ".md", ".pdf", ".csv", ".json", ".html", ".zip", ".svg",
+    ".mp3", ".wav",
+}
 
 
 class SessionState:
@@ -70,6 +79,7 @@ class SessionState:
             "--output-format", "stream-json",
             "--verbose",  # required for stream-json + print
             "--permission-mode", self.permission_mode,
+            f"--add-dir={ATTACHMENT_DIR}",
         ]
         if self.session_id:
             args += ["--resume", self.session_id]
@@ -146,10 +156,55 @@ def split_at_boundary(text: str, max_size: int = DISCORD_LIMIT) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
+def parse_file_line(line: str) -> Path | None:
+    """Parse an explicit MEDIA:/path or FILE:/path line from Claude output."""
+    stripped = line.strip()
+    if stripped.startswith("MEDIA:"):
+        raw_path = stripped[len("MEDIA:"):].strip()
+    elif stripped.startswith("FILE:"):
+        raw_path = stripped[len("FILE:"):].strip()
+    else:
+        return None
+    if raw_path.startswith("file://"):
+        raw_path = raw_path[len("file://"):]
+    if not raw_path:
+        return None
+    return Path(raw_path).expanduser()
+
+
+def is_sendable_file(path: Path) -> bool:
+    """Return true for existing local files small enough for Discord upload."""
+    try:
+        resolved = path.resolve(strict=True)
+        return (
+            resolved.is_file()
+            and resolved.suffix.lower() in SENDABLE_EXTENSIONS
+            and resolved.stat().st_size <= DISCORD_FILE_LIMIT
+        )
+    except OSError:
+        return False
+
+
 async def send_text(channel, text: str) -> None:
-    """Send text as plain Discord markdown, paragraph-aware chunked."""
-    for chunk in split_at_boundary(text):
+    """Send text as Discord markdown, uploading explicit MEDIA:/FILE: lines."""
+    text_chunks: list[str] = []
+    file_paths: list[Path] = []
+
+    for line in text.splitlines():
+        file_path = parse_file_line(line)
+        if file_path is None:
+            text_chunks.append(line)
+        elif is_sendable_file(file_path):
+            file_paths.append(file_path.resolve())
+        else:
+            text_chunks.append(f"_⚠ file not found or not sendable: `{file_path}`_")
+
+    cleaned_text = "\n".join(text_chunks).strip()
+    for chunk in split_at_boundary(cleaned_text):
         await channel.send(chunk)
+
+    for path in file_paths:
+        await channel.send(file=discord.File(path))
 
 
 def format_tool_call(name: str, inp: dict) -> str:
@@ -168,6 +223,44 @@ def format_tool_call(name: str, inp: dict) -> str:
     return f"{name}(...)"
 
 
+def _safe_filename(name: str) -> str:
+    """Return a conservative filename safe for local attachment storage."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return cleaned or "attachment"
+
+
+async def save_attachments(message: discord.Message) -> list[Path]:
+    """Download Discord attachments locally so Claude Code can inspect them by path."""
+    if not message.attachments:
+        return []
+
+    msg_dir = ATTACHMENT_DIR / str(message.id)
+    msg_dir.mkdir(parents=True, exist_ok=True)
+
+    paths: list[Path] = []
+    for idx, attachment in enumerate(message.attachments, start=1):
+        filename = _safe_filename(attachment.filename or f"attachment-{idx}")
+        path = msg_dir / f"{idx:02d}-{filename}"
+        await attachment.save(path)
+        paths.append(path)
+    return paths
+
+
+def build_prompt(content: str, attachment_paths: list[Path]) -> str:
+    """Combine message text with local attachment paths for Claude Code."""
+    body = content.strip()
+    if not attachment_paths:
+        return body
+
+    attachment_lines = [
+        "Attached Discord file(s) were downloaded locally. Inspect them directly by absolute path:",
+        *[f"- {path}" for path in attachment_paths],
+    ]
+    if body:
+        return body + "\n\n" + "\n".join(attachment_lines)
+    return "Please inspect the attached Discord file(s).\n\n" + "\n".join(attachment_lines)
+
+
 async def run_claude_turn(channel, prompt: str) -> None:
     """Run one Claude turn, stream assistant text + tool notifications to Discord."""
     args = state.claude_args(prompt)
@@ -176,6 +269,7 @@ async def run_claude_turn(channel, prompt: str) -> None:
         cwd=WORKDIR,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=CLAUDE_STDOUT_LIMIT,
     )
 
     last_session_id: str | None = None
@@ -359,18 +453,20 @@ async def on_message(message: discord.Message) -> None:
 
     async with _lock:
         try:
-            await _handle(channel, content)
+            attachment_paths = await save_attachments(message)
+            await _handle(channel, content, attachment_paths)
         except Exception as e:
             await channel.send(f"_bridge error: {type(e).__name__}: {e}_")
             raise
 
 
-async def _handle(channel, content: str) -> None:
+async def _handle(channel, content: str, attachment_paths=None) -> None:
     """Handle a plain DM. Bot-config commands work via either `!cmd` or `/cmd`
     (typed as text — the rich slash-command UI handles the same logic via
     interactions). Unknown slash commands fall through to claude as prompts."""
+    attachment_paths = attachment_paths or []
     stripped = content.strip()
-    if not stripped:
+    if not stripped and not attachment_paths:
         return
 
     # Normalize bot-config commands: accept either `!new` or `/new` form.
@@ -378,6 +474,9 @@ async def _handle(channel, content: str) -> None:
     if norm.startswith("!"):
         norm = "/" + norm[1:]  # treat ! as / for matching
     head = norm.split(maxsplit=1)
+    if not head and attachment_paths:
+        await run_claude_turn(channel, build_prompt(content, attachment_paths))
+        return
     cmd = head[0].lower()
     arg = head[1].strip() if len(head) > 1 else ""
 
@@ -433,7 +532,7 @@ async def _handle(channel, content: str) -> None:
 
     # Anything else (including Claude Code skill commands like /init, /review,
     # /security-review) goes to claude as a prompt.
-    await run_claude_turn(channel, content)
+    await run_claude_turn(channel, build_prompt(content, attachment_paths))
 
 
 def main() -> None:
