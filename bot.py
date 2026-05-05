@@ -310,7 +310,8 @@ async def send_text(channel, text: str) -> None:
 def format_tool_call(name: str, inp: dict) -> str:
     """One-line summary of a tool call for an inline notification."""
     if name == "Bash":
-        cmd = inp.get("command", "").strip().splitlines()[0][:80]
+        lines = inp.get("command", "").strip().splitlines()
+        cmd = lines[0][:80] if lines else ""
         return f"$ {cmd}"
     if name in ("Read", "Edit", "Write"):
         path = inp.get("file_path", inp.get("path", ""))
