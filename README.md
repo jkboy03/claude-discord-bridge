@@ -10,6 +10,15 @@ Use [Claude Code](https://claude.com/claude-code) from anywhere via Discord DMs.
 >
 > **What this is not:** an Anthropic-API wrapper, a re-implementation of Claude Code, or a multi-tenant service. It runs on your own machine, uses your own Claude Code authentication (your Claude Max / Pro / Team subscription), and only responds to **one** Discord user (you).
 
+### Two run modes
+
+| Mode | Entry point | Use when |
+|------|-------------|----------|
+| **Single-bot** | [`bot.py`](./bot.py) | One Discord bot, one backend (Claude). Simplest setup. Most users start here. |
+| **Unified multi-bot** | [`unified_bridge.py`](./unified_bridge.py) | Two or more bots in one process. Mix Claude + Codex backends. Optional manager-bot orchestration where a third bot drives the others in a shared channel. |
+
+Both ship in this repo. Pick one based on your needs — they don't run side-by-side. Single-bot setup is documented first; the unified bridge has its own [top-level section](#unified-multi-bot-bridge) with a complete walkthrough.
+
 ---
 
 ## Table of contents
@@ -29,7 +38,8 @@ Use [Claude Code](https://claude.com/claude-code) from anywhere via Discord DMs.
 13. [Security notes](#security-notes)
 14. [Development & testing](#development--testing)
 15. [Contributing](#contributing)
-16. [License](#license)
+16. [**Unified multi-bot bridge**](#unified-multi-bot-bridge) — multiple bots in one process, manager-bot orchestration
+17. [License](#license)
 
 ---
 
@@ -450,3 +460,340 @@ PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+## Unified multi-bot bridge
+
+`unified_bridge.py` runs **multiple Discord bot accounts in one Python process**, optionally with **manager-bot orchestration** so a third bot can drive the workers in a shared channel.
+
+It is the same repo's "advanced" entry point. If you only want one bot, use [`bot.py`](#table-of-contents) and stop reading. If you want two bots — say a Claude-backed coding assistant and a Codex-backed scripting assistant — keep reading.
+
+### When to use it
+
+- You want **two or more Discord bots** without running multiple processes/services.
+- You want **one bot to be backed by Claude and another by Codex** (different models, different strengths).
+- You're building an **agent-orchestration pattern** where a "manager" bot delegates to "worker" bots in a shared channel and you watch it happen live.
+
+### Architecture
+
+```
+                                         ┌── claude --print ──── Anthropic
+                                         │                       (your sub)
+   ┌──────────┐  Discord WS ──┐ ┌───────────────┐
+   │ Discord  │ ──────────── ▶│ unified_bridge ├──── codex exec ──── OpenAI
+   │ gateway  │ ◀────────────┐│   (one PID)    │                   (your sub)
+   └──────────┘               └───────────────┘
+        ▲                       │ shared:
+        │                       │  • attachment store
+   one process holds            │  • per-channel session keys
+   N gateway connections        │  • bot-to-bot __stop__ routing
+   (one per BRIDGE_AGENTS)      │  • outbound FILE:/MEDIA: uploads
+```
+
+For each authorized inbound message:
+
+1. The bridge checks the agent's authorization rules (DM allowlist, channel allowlist, bot allowlist, bot-only channel mode).
+2. It strips the alias prefix or `@mention` for shared-channel messages.
+3. It spawns the configured backend subprocess (`claude --print` or `codex exec`) with the right arguments — including `--resume <session_id>` keyed by the Discord channel, so each channel keeps its own context.
+4. It streams the backend's stdout (NDJSON) and posts assistant text back to the Discord channel.
+
+### Setup walkthrough
+
+**Step 1. Decide your topology.**
+
+The simplest case is two bots both reachable in your DMs, each backed by a different LLM. The richer case is "manager + workers in a shared channel" (covered in [Manager-bot orchestration](#manager-bot-orchestration) below). Either way, the install steps below are the same.
+
+**Step 2. Create one Discord application per bot.**
+
+For each bot you want, repeat these steps at <https://discord.com/developers/applications>:
+
+1. **New Application** → name it (e.g. "Worker A"). Click **Create**.
+2. Left sidebar → **Bot** → **Reset Token**. Copy the token. *You only see it once.*
+3. Same page → **Privileged Gateway Intents** → enable **Message Content Intent**. Free for personal-use bots in fewer than 100 servers, no verification required. Save.
+4. Copy the **Application ID** (left sidebar → **General Information**) — that's the bot's Discord user ID. You'll need it later for cross-bot allowlists.
+5. Build the OAuth invite URL:
+   `https://discord.com/oauth2/authorize?client_id=<APP_ID>&permissions=274877990912&scope=bot+applications.commands`
+   (`274877990912` = Send Messages + Read Message History + Use Slash Commands. Add more if you need them.)
+6. Open the URL, pick the server you want, authorize.
+
+> **Personal scratch server tip.** If you don't already have a private Discord server for this, create one (Discord client → "+" → Create My Own → For me and my friends). It takes 30 seconds and gives you a private space to invite all your bots to without polluting any real server.
+
+**Step 3. Install the bridge.**
+
+```bash
+git clone https://github.com/jkboy03/claude-discord-bridge.git
+cd claude-discord-bridge
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+```
+
+Make sure `claude` (and `codex`, if you're running a Codex bot) are installed and authenticated:
+
+```bash
+claude --version
+claude          # interactive — log in with /login if you haven't
+codex --version # if you have a codex bot
+```
+
+**Step 4. Write your env file.**
+
+Copy `.env.example` and fill in. We **strongly recommend** keeping the real env file outside the repo — for example at `~/.config/unified-discord-bridge/env` — and feeding it via a systemd `EnvironmentFile=` directive, so secrets never live in your git working tree.
+
+```bash
+mkdir -p ~/.config/unified-discord-bridge
+cp .env.example ~/.config/unified-discord-bridge/env
+chmod 600 ~/.config/unified-discord-bridge/env
+${EDITOR:-nano} ~/.config/unified-discord-bridge/env
+```
+
+Minimum config for two bots:
+
+```env
+BRIDGE_AGENTS=worker_a,worker_b
+BRIDGE_ATTACHMENT_DIR=/home/you/.cache/discord-agent-bridge/attachments
+
+WORKER_A_TOKEN=<paste from step 2.2>
+WORKER_A_BACKEND=claude
+WORKER_A_ALLOWED_USER_ID=<your Discord user ID>
+WORKER_A_DEFAULT_MODEL=sonnet
+
+WORKER_B_TOKEN=<paste from step 2.2 of the other app>
+WORKER_B_BACKEND=codex
+WORKER_B_ALLOWED_USER_ID=<your Discord user ID>
+WORKER_B_DEFAULT_MODEL=gpt-5.5
+```
+
+See `.env.example` and the [Env var reference](#env-var-reference) below for every supported flag.
+
+**Step 5. Run as a systemd user service (Linux).**
+
+A reference unit is at [`examples/unified-discord-bridge.service`](./examples/unified-discord-bridge.service). Edit the paths to match your install:
+
+```bash
+cp examples/unified-discord-bridge.service ~/.config/systemd/user/
+${EDITOR:-nano} ~/.config/systemd/user/unified-discord-bridge.service
+# update WorkingDirectory, EnvironmentFile, and ExecStart paths
+
+systemctl --user daemon-reload
+systemctl --user enable --now unified-discord-bridge.service
+journalctl --user -u unified-discord-bridge.service -f
+```
+
+You should see two `[<agent>] logged in as ...` lines — one per bot.
+
+**Step 6. (Optional) Foreground debug launcher.**
+
+`examples/run-unified-bridge.sh` runs the bridge in the foreground, automatically stopping the systemd unit if it's active and restarting it on Ctrl+C. Useful for trying a code change without rolling a new release.
+
+```bash
+cp examples/run-unified-bridge.sh ~/bin/   # or any PATH dir
+chmod +x ~/bin/run-unified-bridge.sh
+
+# Configurable via env vars (or edit defaults inline):
+UNIFIED_BRIDGE_ENV=~/.config/unified-discord-bridge/env \
+  UNIFIED_BRIDGE_DIR=~/claude-discord-bridge \
+  ~/bin/run-unified-bridge.sh
+```
+
+### Manager-bot orchestration
+
+The bridge can be configured so a **third bot** orchestrates the worker bots in a shared channel. The classic shape:
+
+```
+            ┌──────────────────────────────────────────┐
+            │  #orchestration channel                  │
+            │                                          │
+   You ────▶│  @Manager: refactor the auth module      │
+   (DM)     │                                          │
+            │  Manager → "worker_a: read auth/*.py"    │
+            │  Worker A → "<@manager> here are the     │
+            │              files and what they do…"    │
+            │  Manager → "worker_b: write the patch"   │
+            │  Worker B → "<@manager> done, see…"      │
+            │  Manager → DM you: "done: refactor       │
+            │                     complete, summary…"  │
+            └──────────────────────────────────────────┘
+```
+
+You only DM the manager. Workers ignore your DMs. In the orchestration channel, you can either stay silent (manager-only workspace) or speak — depending on the manager's setup. Workers won't talk to you in the channel either way; they only respond to the manager.
+
+#### The four primitives
+
+The bridge ships four authorization/isolation primitives that make this pattern work:
+
+1. **`<PREFIX>_BOT_ONLY_CHANNEL_IDS`** — channels where the *human* user is ignored entirely. Only senders in `<PREFIX>_ALLOWED_BOT_USER_IDS` (i.e. the manager bot) are processed. The orchestration channel becomes the manager's private workspace as far as the worker is concerned.
+
+2. **`<PREFIX>_ACCEPT_DMS=false`** — worker bot ignores DMs from the user entirely. Combined with primitive (1), you can only ever reach the worker by going through the manager.
+
+3. **Per-channel session keys.** Each Discord channel ID gets its own backend session (Codex thread / Claude `session_id`). A user DM with the worker (if DMs are enabled) and a manager-driven conversation in the orchestration channel never share state. This is automatic — no config needed.
+
+4. **`__stop__` from authorized bots.** Any sender in `<PREFIX>_ALLOWED_BOT_USER_IDS` can post `<alias>: __stop__` (or `<@worker_id> __stop__`) and the bridge will abort the running backend turn before acquiring the per-agent lock. The worker's session is preserved — the manager can immediately send a redirect or a follow-up. This is the bot-to-bot equivalent of the human's `/stop` slash command.
+
+Auto-mention prefix: when a worker replies in a `BOT_ONLY_CHANNEL_IDS` channel, the bridge automatically prepends `<@manager_id>` to the first chunk of the reply. This guarantees Discord delivers the full message content to the manager via the @mention path even if the manager's bot doesn't have Message Content Intent.
+
+#### Setup for manager + two workers
+
+Assume:
+- Manager bot user ID: `<MANAGER_ID>`
+- Worker A and Worker B Discord apps already created (Step 2 above)
+- Orchestration channel ID: `<CHANNEL_ID>` (right-click channel in Discord with Developer Mode on → Copy Channel ID)
+- All three bots invited to the server and present in `<CHANNEL_ID>`
+
+Worker config in your env file:
+
+```env
+BRIDGE_AGENTS=worker_a,worker_b
+BRIDGE_ATTACHMENT_DIR=/home/you/.cache/discord-agent-bridge/attachments
+
+WORKER_A_TOKEN=...
+WORKER_A_BACKEND=claude
+WORKER_A_ALLOWED_USER_ID=<your Discord user ID>
+WORKER_A_ACCEPT_DMS=false
+WORKER_A_BOT_ONLY_CHANNEL_IDS=<CHANNEL_ID>
+WORKER_A_ALLOWED_BOT_USER_IDS=<MANAGER_ID>
+WORKER_A_ALIASES=worker_a
+
+WORKER_B_TOKEN=...
+WORKER_B_BACKEND=codex
+WORKER_B_ALLOWED_USER_ID=<your Discord user ID>
+WORKER_B_ACCEPT_DMS=false
+WORKER_B_BOT_ONLY_CHANNEL_IDS=<CHANNEL_ID>
+WORKER_B_ALLOWED_BOT_USER_IDS=<MANAGER_ID>
+WORKER_B_ALIASES=worker_b
+```
+
+The **manager bot is run by something other than this repo** — it is your own orchestrator. Common shapes:
+
+- A separate process running an LLM agent loop (LangGraph, your own Python, an off-the-shelf agent framework) that authenticates as a Discord bot and posts to the channel.
+- An [OpenClaw](https://github.com/anthropics/openclaw) or similar gateway agent wired to the Discord channel.
+- Another instance of `unified_bridge.py` configured with `BRIDGE_AGENTS=manager` and `manager`'s backend pointed at whatever LLM you want — though usually you want richer tooling than the bridge itself provides for the orchestration brain.
+
+The manager addresses workers by alias prefix at line start:
+
+```
+worker_a: read foo.py and summarize the design
+
+worker_b: implement worker_a's plan in src/auth.py
+
+worker_a: __stop__       # abort whatever worker_a is doing
+```
+
+Workers reply in the same channel with `<@manager_id>` prepended (see auto-mention prefix above). The manager reads those replies and decides what to do next.
+
+#### What the bridge does NOT enforce
+
+The bridge provides authorization and the `__stop__` primitive. It does **not** enforce orchestration discipline. **The manager's prompt** is responsible for:
+
+- A step budget (e.g. max 10 worker hops per top-level user request).
+- A "done" signal (e.g. a final reply that starts with `done:`).
+- A per-step timeout (e.g. issue `__stop__` if a worker doesn't reply in 5 minutes).
+- Failure handling (retry once, switch worker, or escalate).
+- Avoiding bot-to-bot loops (don't react to your own posts; always serial across workers).
+
+These are prompt-engineering concerns, not bridge concerns.
+
+### Slash command reference
+
+When the bridge is running, both worker bots register Discord slash commands. Type `/` in any channel where the bot is present to see them with autocomplete.
+
+| Command | On both | On Codex bots | On Claude bots | Effect |
+|---------|:-------:|:-------------:|:--------------:|--------|
+| `/new` | ✅ | | | Drop the saved session/thread for *this channel*. Next prompt starts fresh. |
+| `/stop` | ✅ | | | Abort the running backend turn. Session is preserved. |
+| `/status` | ✅ | | | Show full bot state for this channel — model, effort, session ID, mode, context %, running. Resolves `(default)` to actual configured value from `~/.codex/config.toml` or `~/.claude/settings.json`. |
+| `/help` | ✅ | | | Compact command reference. |
+| `/model <name>` | ✅ | | | Pick the backend model from a dropdown. Codex options: `gpt-5.5`, `gpt-5.4`, `gpt-5.3`, `default`. Claude options: `opus`, `sonnet`, `haiku`, `default`. |
+| `/effort <level>` | ✅ | | | Reasoning effort. Codex: `low`/`medium`/`high`/`xhigh`/`default`. Claude adds `max`. |
+| `/tools <on|off>` | ✅ | | | Toggle inline tool-call notifications. |
+| `/context` | ✅ | | | Detailed token/usage block from the last turn, with model-aware context-window % for Claude. |
+| `/goal [text|clear]` | | ✅ | | Set, show, or clear a sticky goal that's prefixed onto every prompt. |
+| `/sandbox <mode>` | | ✅ | | Codex sandbox mode: `read-only`, `workspace-write`, `danger-full-access`. |
+| `/search <on|off>` | | ✅ | | Toggle Codex web search. |
+| `/review [text]` | | ✅ | | Run `codex exec review` (optional prompt). |
+| `/auto <on|off>` | | | ✅ | Toggle Claude `--permission-mode bypassPermissions` (auto-approve tool use). |
+
+Models, efforts, and modes are *also* settable via the `<PREFIX>_DEFAULT_MODEL` etc. env vars (see below) for cases that need persistence across restarts. Slash commands are runtime overrides for the current process.
+
+### Env var reference
+
+#### Top-level (whole bridge)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `BRIDGE_AGENTS` | ✅ | Comma- or space-separated list of agent names. Each name becomes a `<PREFIX>_*` block. |
+| `BRIDGE_ATTACHMENT_DIR` | | Where Discord-uploaded attachments are saved before workers read them. Default `~/.discord-agent-bridge/attachments`. |
+
+#### Per-agent (replace `<PREFIX>` with the agent name uppercased)
+
+| Variable | Required | Backend | Description |
+|----------|----------|---------|-------------|
+| `<PREFIX>_TOKEN` | ✅ | both | Discord bot token. Falls back to `<PREFIX>_DISCORD_BOT_TOKEN`. |
+| `<PREFIX>_BACKEND` | ✅ | both | `codex` or `claude`. |
+| `<PREFIX>_ALLOWED_USER_ID` | ✅ | both | Your numeric Discord user ID. |
+| `<PREFIX>_WORKDIR` | | both | cwd for the backend subprocess. Default `$HOME`. |
+| `<PREFIX>_ATTACHMENT_DIR` | | both | Override `BRIDGE_ATTACHMENT_DIR` for this agent. |
+| `<PREFIX>_CODEX_BIN` | required if `codex` not on PATH | codex | Absolute path to the `codex` binary. |
+| `<PREFIX>_CLAUDE_BIN` | required if `claude` not on PATH | claude | Absolute path to the `claude` binary. |
+| `<PREFIX>_DEFAULT_MODEL` | | both | Initial model. Override at runtime with `/model`. |
+| `<PREFIX>_DEFAULT_EFFORT` | | both | Initial effort level. Override with `/effort`. |
+| `<PREFIX>_DEFAULT_SANDBOX` | | codex | `read-only`/`workspace-write`/`danger-full-access`. Default `workspace-write`. |
+| `<PREFIX>_DEFAULT_SEARCH` | | codex | `on`/`off`. Default `off`. |
+| `<PREFIX>_CLAUDE_PERMISSION_MODE` | | claude | `bypassPermissions` or `default`. Default `bypassPermissions` (auto-mode on). |
+| `<PREFIX>_ALIASES` | | both | Names this bot answers to in shared channels. Comma-separated. Default: agent name. |
+| `<PREFIX>_ALLOWED_CHANNEL_IDS` | | both | Channel IDs where you AND authorized bots may speak. |
+| `<PREFIX>_ALLOWED_BOT_USER_IDS` | | both | Other bots whose messages this agent honors in allowed channels. |
+| `<PREFIX>_BOT_ONLY_CHANNEL_IDS` | | both | Channels where the human user is IGNORED — only `ALLOWED_BOT_USER_IDS` senders are processed. |
+| `<PREFIX>_ACCEPT_DMS` | | both | `true`/`false`. Default `true`. Set `false` so a worker only responds to its manager. |
+
+### Operational details
+
+**Attachments.** Discord uploads are downloaded to `BRIDGE_ATTACHMENT_DIR/<agent>/<message_id>/`. Codex receives images via `--image`; non-image files are listed in the prompt by absolute path. Claude receives all attachment paths in the prompt and the attachment directory via `--add-dir`.
+
+**Outbound files.** Either backend can have a worker print `FILE:/abs/path/file.md` or `MEDIA:/abs/path/image.png` on its own line. The bridge picks those up and uploads the file to the same Discord channel.
+
+**Per-channel sessions.** Each Discord channel keeps a separate backend session (Codex thread / Claude `session_id`). DM and channel conversations don't share context. `/new` only resets the current channel. Across orchestrations or across topics, you get clean state.
+
+**Logging.** When run via the systemd unit, all stdout/stderr goes to journald. Tail with:
+```bash
+journalctl --user -u unified-discord-bridge.service -f
+```
+
+**Rate limits.** The bridge paces multi-chunk replies at 0.4s per chunk. With 2-3 bots in a channel and serial orchestration, you stay well under Discord's 5 messages/sec cap.
+
+### Troubleshooting (unified bridge)
+
+**Slash command says "you are not authorized."**
+This is from your *manager*'s side (e.g. an OpenClaw agent), not the bridge. The bridge gates by `interaction.user.id == ALLOWED_USER_ID`, which should always pass for you. If you see this from the manager, configure its own user allowlist. For OpenClaw specifically: `openclaw config set 'channels.discord.allowFrom' '["<your-user-id>"]'` then restart its gateway.
+
+**Manager bot doesn't see worker replies.**
+Either (a) Message Content Intent isn't enabled on the manager bot's Discord app, or (b) the auto-mention prefix isn't reaching it. Auto-mention requires `<MANAGER_ID>` to be in `<WORKER_PREFIX>_ALLOWED_BOT_USER_IDS` AND the channel to be in `<WORKER_PREFIX>_BOT_ONLY_CHANNEL_IDS`. Verify both, then have the manager poll `openclaw message read` (or whatever read API your manager uses) as a fallback.
+
+**Worker responds in DM instead of channel.**
+The manager addressed the worker via `--target user:<id>` instead of `--target channel:<id>`. Fix the manager's prompt or tool config.
+
+**`/model` dropdown doesn't include my model.**
+The dropdown is hard-coded to common choices. For others, set `<PREFIX>_DEFAULT_MODEL` in the env file and restart the bridge. Discord allows up to 25 choices per slash command parameter, so the dropdown can be extended in code if you want a richer menu.
+
+**Manager bot says "I don't have a session named worker_a" or similar.**
+The manager is treating the worker as if it were a local agent/session in its own runtime. The worker is a Discord bot reachable only via Discord messages; the manager needs to use a "send Discord message" tool, not a "delegate to subagent" tool. Update the manager's instructions.
+
+**Two bots responded to one message.**
+Check `<PREFIX>_ALIASES` for overlap. Aliases should be unique per bot. Match is case-insensitive at line start.
+
+**Session collision between DM and channel.**
+This is what per-channel sessions prevent. If you see it anyway, you're running an older build of the bridge — pull the latest.
+
+### Differences from `bot.py`
+
+| | `bot.py` | `unified_bridge.py` |
+|--|----------|---------------------|
+| Bots per process | 1 | many (BRIDGE_AGENTS list) |
+| Backends | claude only | claude + codex (mix-and-match per agent) |
+| Manager-bot orchestration | no | yes (BOT_ONLY channels, ACCEPT_DMS, `__stop__`) |
+| Per-channel sessions | no — single session per process | yes — keyed by Discord channel ID |
+| Slash command surface | full | full + `/sandbox`, `/search`, `/goal`, `/review`, `/auto` (per backend) |
+| Auto-mention manager prefix | no | yes (in BOT_ONLY channels) |
+| Outbound `FILE:`/`MEDIA:` uploads | no | yes |
+| Attachment handling | basic | shared attachment store across bots |
+| Code complexity | ~700 lines | ~1170 lines |
+
+`bot.py` is intentionally kept as the simple, single-bot entry point. It is not a deprecated path. New users who only need one bot should start there.

@@ -1,0 +1,46 @@
+# Reference systemd unit for unified_bridge.py.
+#
+# Install this as a USER unit (not a system unit):
+#   cp examples/unified-discord-bridge.service ~/.config/systemd/user/
+#
+# Edit the WorkingDirectory, EnvironmentFile, and ExecStart paths to match
+# where you cloned the repo and where your env file lives.
+#
+# Then enable + start it:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now unified-discord-bridge.service
+#
+# View logs:
+#   journalctl --user -u unified-discord-bridge.service -f
+
+[Unit]
+Description=Unified Discord bridge (multiple bots in one process)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Path to your local clone of this repo.
+WorkingDirectory=/home/your-username/claude-discord-bridge
+
+# Path to your private env file. Keep it OUTSIDE the repo and chmod 600.
+# See .env.example for the full set of variables.
+EnvironmentFile=/home/your-username/.config/unified-discord-bridge/env
+
+# Force unbuffered Python so journal logs are flushed line-by-line.
+Environment=PYTHONUNBUFFERED=1
+
+# Your venv's Python + the bridge entry point.
+ExecStart=/home/your-username/claude-discord-bridge/venv/bin/python /home/your-username/claude-discord-bridge/unified_bridge.py
+
+# Auto-restart on crash. Limit how aggressive the loop is so we don't
+# hammer Discord if the bot is stuck in a startup error.
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
