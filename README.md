@@ -498,5 +498,3 @@ Manual run:
 source venv/bin/activate
 python unified_bridge.py
 ```
-
-macOS LaunchAgent example: `com.neetware.discord-agent-bridge.plist` + `run-launchagent.sh`.
