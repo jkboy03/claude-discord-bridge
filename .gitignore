@@ -38,3 +38,4 @@ tmux_driver.py
 .coverage.*
 htmlcov/
 coverage.xml
+.gitnexus
