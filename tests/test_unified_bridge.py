@@ -161,6 +161,60 @@ class TestRunnerArgsAndRouting:
         assert f"--add-dir={tmp_path / 'attachments'}" in args
         assert args[-1] == "hello"
 
+    def test_status_resolves_codex_defaults_from_config_toml(self, tmp_path, monkeypatch):
+        cfg_dir = tmp_path / ".codex"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.toml").write_text(
+            'model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\n'
+        )
+        monkeypatch.setattr(ub.Path, "home", lambda: tmp_path)
+
+        runner = ub.CodexRunner(self.config(tmp_path, "codex"))
+        block = runner.status(channel_id=42)
+        assert "gpt-5.5" in block and "from ~/.codex/config.toml" in block
+        assert "xhigh" in block
+
+        # Explicit override wins over the config default.
+        runner.model = "gpt-5.4"
+        runner.effort = "high"
+        block = runner.status(channel_id=42)
+        assert "gpt-5.4" in block
+        assert "from ~/.codex/config.toml" not in block.split("model:")[1].split("\n")[0]
+
+    def test_status_resolves_claude_defaults_from_settings_json(self, tmp_path, monkeypatch):
+        cfg_dir = tmp_path / ".claude"
+        cfg_dir.mkdir()
+        (cfg_dir / "settings.json").write_text(
+            '{"model": "sonnet", "effortLevel": "high"}'
+        )
+        monkeypatch.setattr(ub.Path, "home", lambda: tmp_path)
+
+        runner = ub.ClaudeRunner(self.config(tmp_path, "claude"))
+        block = runner.status(channel_id=42)
+        assert "sonnet" in block and "from ~/.claude/settings.json" in block
+        assert "high" in block
+
+    def test_claude_usage_block_with_per_channel_usage(self, tmp_path):
+        runner = ub.ClaudeRunner(self.config(tmp_path, "claude"))
+        runner._last_usage[42] = {
+            "input_tokens": 1000,
+            "cache_creation_input_tokens": 500,
+            "cache_read_input_tokens": 200,
+            "output_tokens": 300,
+        }
+        runner._last_active_model[42] = "claude-sonnet-4-6"
+        block = runner._usage_block(channel_id=42)
+        assert "1,700" in block  # used = 1000 + 500 + 200
+        assert "200,000" in block  # window for sonnet
+        assert "0.9%" in block or "0.85%" in block
+        assert "claude-sonnet-4-6" in block
+
+    def test_context_window_aliases(self, tmp_path):
+        assert ub._context_window_for("claude-sonnet-4-6") == 200_000
+        assert ub._context_window_for("sonnet") == 200_000  # alias resolves
+        assert ub._context_window_for(None) == ub.DEFAULT_CONTEXT_WINDOW
+        assert ub._context_window_for("unknown-model") == ub.DEFAULT_CONTEXT_WINDOW
+
     def test_model_assignment_round_trips(self, tmp_path):
         codex = ub.CodexRunner(self.config(tmp_path, "codex"))
         claude = ub.ClaudeRunner(self.config(tmp_path, "claude"))

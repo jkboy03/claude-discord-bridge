@@ -114,6 +114,56 @@ def is_sendable_file(path: Path) -> bool:
         return False
 
 
+def _read_claude_defaults() -> tuple[str | None, str | None]:
+    """Best-effort read of ~/.claude/settings.json for (model, effort)."""
+    path = Path.home() / ".claude" / "settings.json"
+    if not path.is_file():
+        return (None, None)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return (None, None)
+    return (data.get("model") or None, data.get("effortLevel") or None)
+
+
+def _read_codex_defaults() -> tuple[str | None, str | None]:
+    """Best-effort read of ~/.codex/config.toml for (model, effort)."""
+    path = Path.home() / ".codex" / "config.toml"
+    if not path.is_file():
+        return (None, None)
+    try:
+        text = path.read_text()
+    except OSError:
+        return (None, None)
+
+    def read_key(key: str) -> str | None:
+        match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*['\"]([^'\"]+)['\"]", text)
+        return match.group(1) if match else None
+
+    return (read_key("model"), read_key("model_reasoning_effort"))
+
+
+CONTEXT_WINDOWS: dict[str, int] = {
+    "claude-opus-4-7": 200_000,
+    "claude-opus-4-6": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-haiku-4-5": 200_000,
+}
+DEFAULT_CONTEXT_WINDOW = 200_000
+
+
+def _context_window_for(model: str | None) -> int:
+    if not model:
+        return DEFAULT_CONTEXT_WINDOW
+    if model in CONTEXT_WINDOWS:
+        return CONTEXT_WINDOWS[model]
+    for key, win in CONTEXT_WINDOWS.items():
+        if model in key or key.startswith(f"claude-{model}-"):
+            return win
+    return DEFAULT_CONTEXT_WINDOW
+
+
 def _bot_only_mention_prefix(config: "AgentConfig", channel_id: int | None) -> str:
     """Return a Discord-mention prefix for the manager bot(s) when the
     target channel is in bot_only_channel_ids. Empty string otherwise.
@@ -326,11 +376,24 @@ class CodexRunner:
     def status(self, channel_id: int | None = None) -> str:
         running = self.current_proc is not None and self.current_proc.returncode is None
         thread = self._thread_ids.get(channel_id) or "(none)"
+        cfg_model, cfg_effort = _read_codex_defaults()
+        if self.model:
+            model_line = self.model
+        elif cfg_model:
+            model_line = f"{cfg_model}  (from ~/.codex/config.toml)"
+        else:
+            model_line = "(unset — codex picks built-in default)"
+        if self.effort:
+            effort_line = self.effort
+        elif cfg_effort:
+            effort_line = f"{cfg_effort}  (from ~/.codex/config.toml)"
+        else:
+            effort_line = "(unset — codex picks built-in default)"
         return (
             "```\n"
             f"agent:   {self.config.name}\nbackend: {self.config.backend}\n"
-            f"thread:  {thread}\nmodel:   {self.model or '(default)'}\n"
-            f"effort:  {self.effort or '(default)'}\nsandbox: {self.sandbox}\n"
+            f"thread:  {thread}\nmodel:   {model_line}\n"
+            f"effort:  {effort_line}\nsandbox: {self.sandbox}\n"
             f"search:  {'on' if self.search_enabled else 'off'}\ntools:   {'on' if self.show_tools else 'off'}\n"
             f"goal:    {self.goal or '(none)'}\nrunning: {'yes' if running else 'no'}\n```"
         )
@@ -516,6 +579,8 @@ class ClaudeRunner:
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
         self._session_ids: dict[int | None, str] = {}
+        self._last_usage: dict[int | None, dict] = {}
+        self._last_active_model: dict[int | None, str] = {}
         self.model = config.default_model
         self.effort = config.default_effort
         self.permission_mode = config.claude_permission_mode
@@ -529,18 +594,70 @@ class ClaudeRunner:
         return (
             f"**{self.config.name}** — Claude backend via headless `claude --print`.\n"
             "`/new`, `/auto on|off`, `/stop`, `/model <name|default>`, "
-            "`/effort low|medium|high|xhigh|max|default`, `/tools on|off`, `/status`, `/help`."
+            "`/effort low|medium|high|xhigh|max|default`, `/tools on|off`, "
+            "`/context`, `/status`, `/help`."
         )
 
     def status(self, channel_id: int | None = None) -> str:
         running = self.current_proc is not None and self.current_proc.returncode is None
         session = self._session_ids.get(channel_id) or "(none)"
+        cfg_model, cfg_effort = _read_claude_defaults()
+        if self.model:
+            model_line = self.model
+        elif cfg_model:
+            model_line = f"{cfg_model}  (from ~/.claude/settings.json)"
+        else:
+            model_line = "(unset — Claude Code picks built-in default)"
+        if self.effort:
+            effort_line = self.effort
+        elif cfg_effort:
+            effort_line = f"{cfg_effort}  (from ~/.claude/settings.json)"
+        else:
+            effort_line = "(unset — Claude Code picks built-in default)"
+        usage = self._last_usage.get(channel_id)
+        if usage:
+            used = (
+                int(usage.get("input_tokens", 0) or 0)
+                + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                + int(usage.get("cache_read_input_tokens", 0) or 0)
+            )
+            window = _context_window_for(self._last_active_model.get(channel_id) or self.model)
+            pct = (used / window * 100) if window else 0.0
+            ctx_line = f"{used:,} / {window:,} tokens ({pct:.1f}%)"
+        else:
+            ctx_line = "(no usage yet — send a prompt first)"
         return (
             "```\n"
             f"agent:           {self.config.name}\nbackend:         {self.config.backend}\n"
-            f"session_id:      {session}\nmodel:           {self.model or '(default)'}\n"
-            f"effort:          {self.effort or '(default)'}\npermission_mode: {self.permission_mode}\n"
-            f"tools:           {'on' if self.show_tools else 'off'}\nrunning:         {'yes' if running else 'no'}\n```"
+            f"session_id:      {session}\nmodel:           {model_line}\n"
+            f"effort:          {effort_line}\npermission_mode: {self.permission_mode}\n"
+            f"tools:           {'on' if self.show_tools else 'off'}\n"
+            f"context:         {ctx_line}\nrunning:         {'yes' if running else 'no'}\n```"
+        )
+
+    def _usage_block(self, channel_id: int | None = None) -> str:
+        usage = self._last_usage.get(channel_id)
+        if not usage:
+            return "_no usage recorded yet — send a prompt first_"
+        inp = int(usage.get("input_tokens", 0) or 0)
+        cache_create = int(usage.get("cache_creation_input_tokens", 0) or 0)
+        cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+        output = int(usage.get("output_tokens", 0) or 0)
+        used = inp + cache_create + cache_read
+        active_model = self._last_active_model.get(channel_id) or self.model or "(unknown)"
+        window = _context_window_for(self._last_active_model.get(channel_id) or self.model)
+        pct = (used / window * 100) if window else 0.0
+        free = max(window - used, 0)
+        return (
+            "```\n"
+            f"model:           {active_model}\n"
+            f"context used:    {used:,} / {window:,}  ({pct:.1f}%)\n"
+            f"context free:    {free:,}\n"
+            f"  input:         {inp:,}\n"
+            f"  cache create:  {cache_create:,}\n"
+            f"  cache read:    {cache_read:,}\n"
+            f"output (turn):   {output:,}\n"
+            "```"
         )
 
     async def new(self, channel_id: int | None = None) -> str:
@@ -597,6 +714,15 @@ class ClaudeRunner:
                             await channel.send(f"_↳ {format_claude_tool(block.get('name', '?'), block.get('input', {}) or {})}_")
                 elif etype == "result":
                     last_session_id = event.get("session_id") or last_session_id
+                    if isinstance(event.get("usage"), dict):
+                        self._last_usage[channel_id] = event["usage"]
+                    if event.get("modelUsage") and isinstance(event["modelUsage"], dict):
+                        # First key is the model identifier the API used.
+                        try:
+                            model_used = next(iter(event["modelUsage"]))
+                            self._last_active_model[channel_id] = model_used
+                        except StopIteration:
+                            pass
                     if event.get("is_error"):
                         error_payload = event.get("result") or "(unknown error)"
         stderr_data = b""
@@ -619,6 +745,10 @@ class ClaudeRunner:
             await channel.send(f"_warning: {error_payload}_")
 
     async def handle_command(self, channel, cmd: str, arg: str) -> bool:
+        channel_id = getattr(channel, "id", None)
+        if cmd == "/context":
+            await channel.send(self._usage_block(channel_id))
+            return True
         if cmd == "/auto":
             if arg.lower() in {"", "on"}:
                 self.permission_mode = "bypassPermissions"
@@ -820,6 +950,130 @@ class AgentBridge:
             self.runner.model = new_model
             label = self.runner.model or "(default)"
             await interaction.response.send_message(f"_model: {label}_", ephemeral=True)
+
+        # /tools, /context, /effort apply to both backends.
+        tools_choices = [
+            app_commands.Choice(name="on", value="on"),
+            app_commands.Choice(name="off", value="off"),
+        ]
+
+        @self.tree.command(name="tools", description="Show or hide tool-call notifications inline")
+        @app_commands.choices(mode=tools_choices)
+        async def slash_tools(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+            if interaction.user.id != self.config.allowed_user_id:
+                return await self._deny(interaction)
+            self.runner.show_tools = mode.value == "on"
+            await interaction.response.send_message(
+                f"_tool notifications {'on' if self.runner.show_tools else 'off'}_",
+                ephemeral=True,
+            )
+
+        @self.tree.command(name="context", description="Show context/usage from the last turn")
+        async def slash_context(interaction: discord.Interaction):
+            if interaction.user.id != self.config.allowed_user_id:
+                return await self._deny(interaction)
+            channel_id = getattr(interaction.channel, "id", None)
+            await interaction.response.send_message(self.runner._usage_block(channel_id), ephemeral=True)
+
+        if self.config.backend == "codex":
+            codex_effort_choices = [
+                app_commands.Choice(name=v, value=v)
+                for v in ("low", "medium", "high", "xhigh", "default")
+            ]
+
+            @self.tree.command(name="effort", description="Set reasoning effort for next turns")
+            @app_commands.choices(level=codex_effort_choices)
+            async def slash_effort_codex(interaction: discord.Interaction, level: app_commands.Choice[str]):
+                if interaction.user.id != self.config.allowed_user_id:
+                    return await self._deny(interaction)
+                self.runner.effort = None if level.value == "default" else level.value
+                await interaction.response.send_message(
+                    f"_effort: {self.runner.effort or '(default)'}_",
+                    ephemeral=True,
+                )
+
+            sandbox_choices = [
+                app_commands.Choice(name=v, value=v) for v in sorted(SANDBOX_MODES)
+            ]
+
+            @self.tree.command(name="sandbox", description="Set sandbox mode for new Codex threads")
+            @app_commands.choices(mode=sandbox_choices)
+            async def slash_sandbox(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+                if interaction.user.id != self.config.allowed_user_id:
+                    return await self._deny(interaction)
+                self.runner.sandbox = mode.value
+                await interaction.response.send_message(
+                    f"_sandbox: {self.runner.sandbox}_", ephemeral=True
+                )
+
+            @self.tree.command(name="search", description="Toggle Codex web search for new threads")
+            @app_commands.choices(mode=tools_choices)
+            async def slash_search(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+                if interaction.user.id != self.config.allowed_user_id:
+                    return await self._deny(interaction)
+                self.runner.search_enabled = mode.value == "on"
+                await interaction.response.send_message(
+                    f"_search: {'on' if self.runner.search_enabled else 'off'}_",
+                    ephemeral=True,
+                )
+
+            @self.tree.command(name="goal", description="Set, show, or clear sticky bridge goal")
+            @app_commands.describe(text="Goal text. Use 'clear' to clear, or omit to show current.")
+            async def slash_goal(interaction: discord.Interaction, text: str | None = None):
+                if interaction.user.id != self.config.allowed_user_id:
+                    return await self._deny(interaction)
+                if text is None or not text.strip():
+                    msg = f"_goal: {self.runner.goal or '(none)'}_"
+                elif text.strip().lower() in {"clear", "off", "none", "reset"}:
+                    self.runner.goal = None
+                    msg = "_goal cleared_"
+                else:
+                    self.runner.goal = text.strip()
+                    msg = "_goal set_"
+                await interaction.response.send_message(msg, ephemeral=True)
+
+            @self.tree.command(name="review", description="Run codex exec review")
+            @app_commands.describe(prompt="Optional review prompt; omit for repo-wide review.")
+            async def slash_review(interaction: discord.Interaction, prompt: str | None = None):
+                if interaction.user.id != self.config.allowed_user_id:
+                    return await self._deny(interaction)
+                await interaction.response.send_message("_running codex review…_", ephemeral=True)
+                async with self.lock:
+                    await self.runner._run_codex(interaction.channel, prompt or "", review=True)
+
+        else:  # claude backend
+            claude_effort_choices = [
+                app_commands.Choice(name=v, value=v)
+                for v in ("low", "medium", "high", "xhigh", "max", "default")
+            ]
+
+            @self.tree.command(name="effort", description="Set reasoning effort for next turns")
+            @app_commands.choices(level=claude_effort_choices)
+            async def slash_effort_claude(interaction: discord.Interaction, level: app_commands.Choice[str]):
+                if interaction.user.id != self.config.allowed_user_id:
+                    return await self._deny(interaction)
+                self.runner.effort = None if level.value == "default" else level.value
+                await interaction.response.send_message(
+                    f"_effort: {self.runner.effort or '(default)'}_",
+                    ephemeral=True,
+                )
+
+            auto_choices = [
+                app_commands.Choice(name="on", value="on"),
+                app_commands.Choice(name="off", value="off"),
+            ]
+
+            @self.tree.command(name="auto", description="Toggle auto-mode (bypassPermissions)")
+            @app_commands.choices(mode=auto_choices)
+            async def slash_auto(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+                if interaction.user.id != self.config.allowed_user_id:
+                    return await self._deny(interaction)
+                self.runner.permission_mode = (
+                    "bypassPermissions" if mode.value == "on" else "default"
+                )
+                await interaction.response.send_message(
+                    f"_auto mode {mode.value}_", ephemeral=True
+                )
 
     async def handle(self, channel, content: str, attachment_paths: list[Path] | None = None) -> None:
         attachment_paths = attachment_paths or []
