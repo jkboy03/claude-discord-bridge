@@ -114,7 +114,28 @@ def is_sendable_file(path: Path) -> bool:
         return False
 
 
-async def send_text(channel, text: str) -> None:
+def _bot_only_mention_prefix(config: "AgentConfig", channel_id: int | None) -> str:
+    """Return a Discord-mention prefix for the manager bot(s) when the
+    target channel is in bot_only_channel_ids. Empty string otherwise.
+
+    Auto-mentioning the manager guarantees the gateway delivers the worker
+    reply's full content to the manager's session even if its bot app
+    lacks Message Content Intent.
+    """
+    if channel_id is None or channel_id not in config.bot_only_channel_ids:
+        return ""
+    if not config.allowed_bot_user_ids:
+        return ""
+    return " ".join(f"<@{uid}>" for uid in sorted(config.allowed_bot_user_ids))
+
+
+async def send_text(channel, text: str, *, mention_prefix: str = "") -> None:
+    """Send text to a Discord channel, splitting at boundaries.
+
+    `mention_prefix` is prepended to the first chunk only. Used to @mention
+    the manager bot in bot-only orchestration channels so its gateway
+    delivers full content even without Message Content Intent active.
+    """
     text_lines: list[str] = []
     file_paths: list[Path] = []
     for line in text.splitlines():
@@ -126,9 +147,12 @@ async def send_text(channel, text: str) -> None:
         else:
             text_lines.append(f"_warning: file not found or not sendable: `{file_path}`_")
 
-    for i, chunk in enumerate(split_at_boundary("\n".join(text_lines).strip())):
+    chunks = split_at_boundary("\n".join(text_lines).strip())
+    for i, chunk in enumerate(chunks):
         if i > 0:
             await asyncio.sleep(0.4)
+        if i == 0 and mention_prefix:
+            chunk = f"{mention_prefix} {chunk}"
         await channel.send(chunk)
     for path in file_paths:
         await channel.send(file=discord.File(path))
@@ -288,6 +312,9 @@ class CodexRunner:
         self.goal: str | None = None
         self.current_proc: asyncio.subprocess.Process | None = None
 
+    def _mention_prefix_for(self, channel_id: int | None) -> str:
+        return _bot_only_mention_prefix(self.config, channel_id)
+
     def help(self) -> str:
         return (
             f"**{self.config.name}** — Codex backend via `codex exec --json`.\n"
@@ -362,6 +389,7 @@ class CodexRunner:
 
     async def _run_codex(self, channel, prompt: str, *, review: bool = False, image_paths: list[Path] | None = None) -> None:
         channel_id = getattr(channel, "id", None)
+        mention_prefix = self._mention_prefix_for(channel_id)
         rendered = prompt if review else self._compose_prompt(prompt)
         args = self.review_args(rendered) if review else self.codex_args(rendered, channel_id, image_paths)
         proc = await asyncio.create_subprocess_exec(
@@ -399,7 +427,7 @@ class CodexRunner:
                     if itype == "agent_message" and etype == "item.completed":
                         text = (item.get("text") or "").strip()
                         if text:
-                            await send_text(channel, text)
+                            await send_text(channel, text, mention_prefix=mention_prefix)
                     elif self.show_tools and itype != "agent_message":
                         await channel.send(f"_> {format_codex_item(item)}_")
                 elif etype == "turn.completed" and isinstance(event.get("usage"), dict):
@@ -494,6 +522,9 @@ class ClaudeRunner:
         self.show_tools = False
         self.current_proc: asyncio.subprocess.Process | None = None
 
+    def _mention_prefix_for(self, channel_id: int | None) -> str:
+        return _bot_only_mention_prefix(self.config, channel_id)
+
     def help(self) -> str:
         return (
             f"**{self.config.name}** — Claude backend via headless `claude --print`.\n"
@@ -536,6 +567,7 @@ class ClaudeRunner:
 
     async def _run_claude(self, channel, prompt: str) -> None:
         channel_id = getattr(channel, "id", None)
+        mention_prefix = self._mention_prefix_for(channel_id)
         proc = await asyncio.create_subprocess_exec(
             *self.claude_args(prompt, channel_id), cwd=str(self.config.workdir), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=STREAM_BUFFER_LIMIT,
@@ -560,7 +592,7 @@ class ClaudeRunner:
                         if btype == "text":
                             text = (block.get("text") or "").strip()
                             if text:
-                                await send_text(channel, text)
+                                await send_text(channel, text, mention_prefix=mention_prefix)
                         elif btype == "tool_use" and self.show_tools:
                             await channel.send(f"_↳ {format_claude_tool(block.get('name', '?'), block.get('input', {}) or {})}_")
                 elif etype == "result":

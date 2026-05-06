@@ -287,6 +287,35 @@ class TestSharedChannelRouting:
         assert proc.terminated is True
         assert "stopped" in msg
 
+    def test_mention_prefix_only_in_bot_only_channels(self, tmp_path):
+        cfg = TestRunnerArgsAndRouting().config(tmp_path, "codex")
+        cfg.bot_only_channel_ids = {7000}
+        cfg.allowed_bot_user_ids = {123, 456}
+
+        # In a bot-only channel, both manager mentions get prefixed.
+        prefix = ub._bot_only_mention_prefix(cfg, 7000)
+        assert "<@123>" in prefix and "<@456>" in prefix
+
+        # In a regular channel or DM, no mention prefix.
+        assert ub._bot_only_mention_prefix(cfg, 9999) == ""
+        assert ub._bot_only_mention_prefix(cfg, None) == ""
+
+        # Bot-only channel but no manager configured: still no prefix.
+        cfg.allowed_bot_user_ids = set()
+        assert ub._bot_only_mention_prefix(cfg, 7000) == ""
+
+    async def test_send_text_prepends_mention_in_bot_only_channel(self, tmp_path):
+        ch = Channel()
+        await ub.send_text(ch, "hello world", mention_prefix="<@9001>")
+
+        assert ch.sent[0].startswith("<@9001> hello world")
+
+    async def test_send_text_no_mention_when_prefix_empty(self, tmp_path):
+        ch = Channel()
+        await ub.send_text(ch, "hello world")
+
+        assert ch.sent[0] == "hello world"
+
     def test_accept_dms_false_ignores_dms(self, tmp_path):
         bridge = self._bridge(tmp_path, accept_dms=False)
 
