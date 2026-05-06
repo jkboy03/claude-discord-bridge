@@ -161,6 +161,26 @@ class TestRunnerArgsAndRouting:
         assert f"--add-dir={tmp_path / 'attachments'}" in args
         assert args[-1] == "hello"
 
+    def test_model_assignment_round_trips(self, tmp_path):
+        codex = ub.CodexRunner(self.config(tmp_path, "codex"))
+        claude = ub.ClaudeRunner(self.config(tmp_path, "claude"))
+
+        # Initial state honors config defaults (None when unset).
+        assert codex.model is None
+        assert claude.model is None
+
+        # Slash command path writes runner.model directly; verify it lands.
+        codex.model = "gpt-5.4"
+        claude.model = "opus"
+        assert "gpt-5.4" in codex.codex_args("ping")
+        assert "opus" in claude.claude_args("ping")
+
+        # 'default' clears.
+        codex.model = None
+        claude.model = None
+        assert "--model" not in codex.codex_args("ping")
+        assert "--model" not in claude.claude_args("ping")
+
     def test_codex_per_channel_thread_isolation(self, tmp_path):
         runner = ub.CodexRunner(self.config(tmp_path, "codex"))
         runner._thread_ids[100] = "thread-A"

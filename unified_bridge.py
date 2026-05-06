@@ -811,6 +811,16 @@ class AgentBridge:
                 return await self._deny(interaction)
             await interaction.response.send_message(self.runner.help(), ephemeral=True)
 
+        @self.tree.command(name="model", description="Set the backend model for next turns")
+        @app_commands.describe(name="Model name (e.g. sonnet, gpt-5.5). Use 'default' to clear.")
+        async def slash_model(interaction: discord.Interaction, name: str):
+            if interaction.user.id != self.config.allowed_user_id:
+                return await self._deny(interaction)
+            new_model = None if name.strip().lower() in {"", "default"} else name.strip()
+            self.runner.model = new_model
+            label = self.runner.model or "(default)"
+            await interaction.response.send_message(f"_model: {label}_", ephemeral=True)
+
     async def handle(self, channel, content: str, attachment_paths: list[Path] | None = None) -> None:
         attachment_paths = attachment_paths or []
         channel_id = getattr(channel, "id", None)
