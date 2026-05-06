@@ -450,3 +450,53 @@ PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+## Unified Multi-Agent Bridge
+
+`unified_bridge.py` can run multiple Discord bot accounts from one LaunchAgent/process while sharing the same attachment and upload code. This supports a Claude-backed bot and a Codex-backed bot without duplicating bridge infrastructure.
+
+```text
+Discord bot clients -> unified_bridge.py -> Claude or Codex runner -> Discord reply
+```
+
+Configure with `BRIDGE_AGENTS` and per-agent environment prefixes:
+
+```env
+BRIDGE_AGENTS=claude_agent,codex_agent
+BRIDGE_ATTACHMENT_DIR=/Users/you/.discord-agent-bridge/attachments
+
+CLAUDE_AGENT_TOKEN=***
+CLAUDE_AGENT_BACKEND=claude
+CLAUDE_AGENT_ALLOWED_USER_ID=123456789012345678
+CLAUDE_AGENT_WORKDIR=/Users/you/Projects
+CLAUDE_AGENT_CLAUDE_BIN=/Users/you/.local/bin/claude
+CLAUDE_AGENT_ALIASES=claudette,claude
+
+CODEX_AGENT_TOKEN=***
+CODEX_AGENT_BACKEND=codex
+CODEX_AGENT_ALLOWED_USER_ID=123456789012345678
+CODEX_AGENT_WORKDIR=/Users/you/Projects
+CODEX_AGENT_CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex
+CODEX_AGENT_DEFAULT_SANDBOX=workspace-write
+CODEX_AGENT_ALIASES=luna,codex
+```
+
+Inbound attachments are downloaded once through shared code. Codex receives image attachments with `--image`; non-image files are listed in the prompt by absolute path. Claude receives attachment paths in the prompt and the attachment directory via `--add-dir`.
+
+Outbound files work for both backends by printing either marker on its own line:
+
+```text
+FILE:/absolute/path/to/file.md
+MEDIA:/absolute/path/to/image.png
+```
+
+For shared Discord channels, set `<PREFIX>_ALLOWED_CHANNEL_IDS`, `<PREFIX>_ALLOWED_BOT_USER_IDS`, and `<PREFIX>_ALIASES`. Prefix messages like `luna: ...` or `claudette: ...` so only the targeted bot responds. DMs still route by allowlisted user ID.
+
+Manual run:
+
+```bash
+source venv/bin/activate
+python unified_bridge.py
+```
+
+macOS LaunchAgent example: `com.neetware.discord-agent-bridge.plist` + `run-launchagent.sh`.
