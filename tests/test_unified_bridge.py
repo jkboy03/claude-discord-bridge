@@ -17,7 +17,8 @@ class AsyncCM:
 
 
 class Channel:
-    def __init__(self):
+    def __init__(self, channel_id: int = 555):
+        self.id = channel_id
         self.sent = []
         self.files = []
 
@@ -144,7 +145,7 @@ class TestRunnerArgsAndRouting:
         image = tmp_path / "img.png"
         doc = tmp_path / "doc.md"
         prompt = ub.build_prompt("inspect", [doc])
-        args = runner.codex_args(prompt, [image])
+        args = runner.codex_args(prompt, image_paths=[image])
 
         assert "--image" in args and str(image) in args
         assert any(str(doc) in arg for arg in args)
@@ -153,12 +154,40 @@ class TestRunnerArgsAndRouting:
 
     def test_claude_uses_add_dir_and_resume(self, tmp_path):
         runner = ub.ClaudeRunner(self.config(tmp_path, "claude"))
-        runner.session_id = "sess-1"
-        args = runner.claude_args("hello")
+        runner._session_ids[42] = "sess-1"
+        args = runner.claude_args("hello", channel_id=42)
 
         assert "--resume" in args and "sess-1" in args
         assert f"--add-dir={tmp_path / 'attachments'}" in args
         assert args[-1] == "hello"
+
+    def test_codex_per_channel_thread_isolation(self, tmp_path):
+        runner = ub.CodexRunner(self.config(tmp_path, "codex"))
+        runner._thread_ids[100] = "thread-A"
+        runner._thread_ids[200] = "thread-B"
+
+        args_a = runner.codex_args("ping", channel_id=100)
+        args_b = runner.codex_args("ping", channel_id=200)
+        args_dm = runner.codex_args("ping", channel_id=999)
+
+        assert "thread-A" in args_a and "thread-B" not in args_a
+        assert "thread-B" in args_b and "thread-A" not in args_b
+        # Unknown channel = fresh thread (no resume).
+        assert "resume" not in args_dm
+        assert "thread-A" not in args_dm and "thread-B" not in args_dm
+
+    def test_claude_per_channel_session_isolation(self, tmp_path):
+        runner = ub.ClaudeRunner(self.config(tmp_path, "claude"))
+        runner._session_ids[100] = "sess-A"
+        runner._session_ids[200] = "sess-B"
+
+        args_a = runner.claude_args("hi", channel_id=100)
+        args_b = runner.claude_args("hi", channel_id=200)
+        args_dm = runner.claude_args("hi", channel_id=999)
+
+        assert "sess-A" in args_a and "sess-B" not in args_a
+        assert "sess-B" in args_b and "sess-A" not in args_b
+        assert "--resume" not in args_dm
 
     async def test_agent_bridge_common_commands_route_to_runner(self, tmp_path):
         bridge = ub.AgentBridge(self.config(tmp_path, "codex"), ub.AttachmentStore(tmp_path / "attachments"))
@@ -174,9 +203,102 @@ class TestRunnerArgsAndRouting:
 
 
 class TestSharedChannelRouting:
+    def _bridge(self, tmp_path, **overrides):
+        cfg = TestRunnerArgsAndRouting().config(tmp_path, "codex")
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        return ub.AgentBridge(cfg, ub.AttachmentStore(tmp_path / "attachments"))
+
     def test_channel_prompt_requires_agent_alias(self, tmp_path):
-        bridge = ub.AgentBridge(TestRunnerArgsAndRouting().config(tmp_path, "codex"), ub.AttachmentStore(tmp_path / "attachments"))
+        bridge = self._bridge(tmp_path)
 
         assert bridge._channel_prompt_for_agent("luna: say hi") == "say hi"
         assert bridge._channel_prompt_for_agent("Luna only: say hi") == "say hi"
         assert bridge._channel_prompt_for_agent("claudette: say hi") is None
+
+    def test_alias_in_message_body_does_not_trigger(self, tmp_path):
+        """Worker replies that mention another agent in passing must not route."""
+        bridge = self._bridge(tmp_path)
+
+        # alias appears mid-body, not at start
+        assert bridge._channel_prompt_for_agent("here is what luna: said earlier") is None
+        assert bridge._channel_prompt_for_agent("ok\nluna: do x") is None
+        # Leading whitespace is fine; alias must still be the first token.
+        assert bridge._channel_prompt_for_agent("  luna: do x") == "do x"
+
+    def test_bot_only_channel_ignores_human_user(self, tmp_path):
+        manager_bot_id = 9001
+        target_channel = 700
+        bridge = self._bridge(
+            tmp_path,
+            allowed_channel_ids=set(),
+            bot_only_channel_ids={target_channel},
+            allowed_bot_user_ids={manager_bot_id},
+        )
+
+        class Author:
+            def __init__(self, author_id, is_bot):
+                self.id = author_id
+                self.bot = is_bot
+
+        class FakeChannel:
+            def __init__(self, channel_id):
+                self.id = channel_id
+
+        class FakeMsg:
+            def __init__(self, channel_id, author_id, is_bot):
+                self.channel = FakeChannel(channel_id)
+                self.author = Author(author_id, is_bot)
+
+        # Human (allowed_user_id) speaking in the bot-only channel: ignored.
+        assert bridge._is_authorized_message(FakeMsg(target_channel, 111, False)) is False
+        # Manager bot in bot-only channel: authorized.
+        assert bridge._is_authorized_message(FakeMsg(target_channel, manager_bot_id, True)) is True
+        # Random bot (not in allowlist) in bot-only channel: ignored.
+        assert bridge._is_authorized_message(FakeMsg(target_channel, 9999, True)) is False
+
+    async def test_stop_marker_aborts_running_proc(self, tmp_path):
+        """do_stop terminates current_proc; the on_message branch that handles
+        '__stop__' from a manager bot delegates to that. Verify the building
+        block."""
+        bridge = self._bridge(tmp_path)
+
+        class FakeProc:
+            def __init__(self):
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self):
+                return self.returncode
+
+        proc = FakeProc()
+        bridge.runner.current_proc = proc
+        msg = await ub.do_stop(bridge.runner)
+
+        assert proc.terminated is True
+        assert "stopped" in msg
+
+    def test_accept_dms_false_ignores_dms(self, tmp_path):
+        bridge = self._bridge(tmp_path, accept_dms=False)
+
+        class Author:
+            def __init__(self, author_id, is_bot):
+                self.id = author_id
+                self.bot = is_bot
+
+        class FakeMsg:
+            def __init__(self, author_id, is_bot=False):
+                self.channel = ub.discord.DMChannel.__new__(ub.discord.DMChannel)
+                self.author = Author(author_id, is_bot)
+
+        # Even the allowlisted user gets ignored when accept_dms is off.
+        assert bridge._is_authorized_message(FakeMsg(111)) is False

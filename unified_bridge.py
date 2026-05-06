@@ -192,6 +192,12 @@ class AgentConfig:
     claude_bin: str = ""
     allowed_channel_ids: set[int] = field(default_factory=set)
     allowed_bot_user_ids: set[int] = field(default_factory=set)
+    # Channels where the human user is ignored. Only senders in
+    # allowed_bot_user_ids may speak. Subset of allowed_channel_ids.
+    bot_only_channel_ids: set[int] = field(default_factory=set)
+    # When False the bridge ignores all DMs (use for worker bots
+    # that should only respond to a manager bot in shared channels).
+    accept_dms: bool = True
     default_model: str | None = None
     default_effort: str | None = None
     default_sandbox: str = "workspace-write"
@@ -244,6 +250,8 @@ class AgentConfig:
             claude_bin=claude_bin,
             allowed_channel_ids=_split_ids(env("ALLOWED_CHANNEL_IDS")),
             allowed_bot_user_ids=_split_ids(env("ALLOWED_BOT_USER_IDS")),
+            bot_only_channel_ids=_split_ids(env("BOT_ONLY_CHANNEL_IDS")),
+            accept_dms=_env_bool(f"{prefix}_ACCEPT_DMS", True),
             default_model=env("DEFAULT_MODEL") or None,
             default_effort=env("DEFAULT_EFFORT") or None,
             default_sandbox=sandbox,
@@ -258,9 +266,9 @@ class BackendRunner(Protocol):
     show_tools: bool
     current_proc: asyncio.subprocess.Process | None
 
-    def status(self) -> str: ...
+    def status(self, channel_id: int | None = None) -> str: ...
     def help(self) -> str: ...
-    async def new(self) -> str: ...
+    async def new(self, channel_id: int | None = None) -> str: ...
     async def run(self, channel, prompt: str, attachment_paths: list[Path]) -> None: ...
     async def handle_command(self, channel, cmd: str, arg: str) -> bool: ...
 
@@ -268,14 +276,16 @@ class BackendRunner(Protocol):
 class CodexRunner:
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
-        self.thread_id: str | None = None
+        # Per-channel session state. None as a key is used as the legacy/global
+        # bucket for callers that don't pass a channel_id (e.g. unit tests).
+        self._thread_ids: dict[int | None, str] = {}
+        self._last_usage: dict[int | None, dict] = {}
         self.model = config.default_model
         self.effort = config.default_effort
         self.sandbox = config.default_sandbox
         self.search_enabled = config.default_search
         self.show_tools = False
         self.goal: str | None = None
-        self.last_usage: dict | None = None
         self.current_proc: asyncio.subprocess.Process | None = None
 
     def help(self) -> str:
@@ -286,19 +296,20 @@ class CodexRunner:
             "`/tools on|off`, `/context`, `/status`, `/help`."
         )
 
-    def status(self) -> str:
+    def status(self, channel_id: int | None = None) -> str:
         running = self.current_proc is not None and self.current_proc.returncode is None
+        thread = self._thread_ids.get(channel_id) or "(none)"
         return (
             "```\n"
             f"agent:   {self.config.name}\nbackend: {self.config.backend}\n"
-            f"thread:  {self.thread_id or '(none)'}\nmodel:   {self.model or '(default)'}\n"
+            f"thread:  {thread}\nmodel:   {self.model or '(default)'}\n"
             f"effort:  {self.effort or '(default)'}\nsandbox: {self.sandbox}\n"
             f"search:  {'on' if self.search_enabled else 'off'}\ntools:   {'on' if self.show_tools else 'off'}\n"
             f"goal:    {self.goal or '(none)'}\nrunning: {'yes' if running else 'no'}\n```"
         )
 
-    async def new(self) -> str:
-        self.thread_id = None
+    async def new(self, channel_id: int | None = None) -> str:
+        self._thread_ids.pop(channel_id, None)
         return "_new Codex thread — next prompt starts fresh_"
 
     def _model_args(self) -> list[str]:
@@ -309,14 +320,20 @@ class CodexRunner:
             args += ["--config", f'model_reasoning_effort="{self.effort}"']
         return args
 
-    def codex_args(self, prompt: str, image_paths: list[Path] | None = None) -> list[str]:
+    def codex_args(
+        self,
+        prompt: str,
+        channel_id: int | None = None,
+        image_paths: list[Path] | None = None,
+    ) -> list[str]:
         image_args: list[str] = []
         for path in image_paths or []:
             image_args += ["--image", str(path)]
-        if self.thread_id:
+        thread_id = self._thread_ids.get(channel_id)
+        if thread_id:
             return [
                 self.config.codex_bin, "exec", "resume", "--json", "--skip-git-repo-check",
-                *self._model_args(), self.thread_id, prompt, *image_args,
+                *self._model_args(), thread_id, prompt, *image_args,
             ]
         args = [
             self.config.codex_bin, "exec", "--json", "--skip-git-repo-check", "-C",
@@ -344,8 +361,9 @@ class CodexRunner:
         await self._run_codex(channel, build_prompt(prompt, file_paths), image_paths=image_paths)
 
     async def _run_codex(self, channel, prompt: str, *, review: bool = False, image_paths: list[Path] | None = None) -> None:
+        channel_id = getattr(channel, "id", None)
         rendered = prompt if review else self._compose_prompt(prompt)
-        args = self.review_args(rendered) if review else self.codex_args(rendered, image_paths)
+        args = self.review_args(rendered) if review else self.codex_args(rendered, channel_id, image_paths)
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=str(self.config.workdir), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=STREAM_BUFFER_LIMIT,
@@ -385,7 +403,7 @@ class CodexRunner:
                     elif self.show_tools and itype != "agent_message":
                         await channel.send(f"_> {format_codex_item(item)}_")
                 elif etype == "turn.completed" and isinstance(event.get("usage"), dict):
-                    self.last_usage = event["usage"]
+                    self._last_usage[channel_id] = event["usage"]
                 elif etype == "error":
                     error_payload = event.get("message") or event.get("error") or "unknown error"
         stderr_data = b""
@@ -398,7 +416,7 @@ class CodexRunner:
         stopped_by_user = proc.returncode is not None and proc.returncode < 0
         self.current_proc = None
         if last_thread_id and not review:
-            self.thread_id = last_thread_id
+            self._thread_ids[channel_id] = last_thread_id
         if stopped_by_user:
             return
         if proc.returncode != 0 and error_payload is None:
@@ -408,6 +426,7 @@ class CodexRunner:
             await channel.send(f"_warning: {error_payload}_")
 
     async def handle_command(self, channel, cmd: str, arg: str) -> bool:
+        channel_id = getattr(channel, "id", None)
         if cmd == "/goal":
             if not arg:
                 await channel.send(f"_goal: {self.goal or '(none)'}_")
@@ -451,14 +470,14 @@ class CodexRunner:
                 await channel.send(f"_search: {'on' if self.search_enabled else 'off'}_")
             return True
         if cmd == "/context":
-            await channel.send(self._usage_block())
+            await channel.send(self._usage_block(channel_id))
             return True
         return False
 
-    def _usage_block(self) -> str:
-        if not self.last_usage:
+    def _usage_block(self, channel_id: int | None = None) -> str:
+        u = self._last_usage.get(channel_id)
+        if not u:
             return "_no usage recorded yet - send a prompt first_"
-        u = self.last_usage
         return "```\ninput:      {:,}\ncached:     {:,}\noutput:     {:,}\nreasoning:  {:,}\n```".format(
             int(u.get("input_tokens", 0) or 0), int(u.get("cached_input_tokens", 0) or 0),
             int(u.get("output_tokens", 0) or 0), int(u.get("reasoning_output_tokens", 0) or 0),
@@ -468,7 +487,7 @@ class CodexRunner:
 class ClaudeRunner:
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
-        self.session_id: str | None = None
+        self._session_ids: dict[int | None, str] = {}
         self.model = config.default_model
         self.effort = config.default_effort
         self.permission_mode = config.claude_permission_mode
@@ -482,27 +501,29 @@ class ClaudeRunner:
             "`/effort low|medium|high|xhigh|max|default`, `/tools on|off`, `/status`, `/help`."
         )
 
-    def status(self) -> str:
+    def status(self, channel_id: int | None = None) -> str:
         running = self.current_proc is not None and self.current_proc.returncode is None
+        session = self._session_ids.get(channel_id) or "(none)"
         return (
             "```\n"
             f"agent:           {self.config.name}\nbackend:         {self.config.backend}\n"
-            f"session_id:      {self.session_id or '(none)'}\nmodel:           {self.model or '(default)'}\n"
+            f"session_id:      {session}\nmodel:           {self.model or '(default)'}\n"
             f"effort:          {self.effort or '(default)'}\npermission_mode: {self.permission_mode}\n"
             f"tools:           {'on' if self.show_tools else 'off'}\nrunning:         {'yes' if running else 'no'}\n```"
         )
 
-    async def new(self) -> str:
-        self.session_id = None
+    async def new(self, channel_id: int | None = None) -> str:
+        self._session_ids.pop(channel_id, None)
         return "_new Claude session — next prompt starts fresh_"
 
-    def claude_args(self, prompt: str) -> list[str]:
+    def claude_args(self, prompt: str, channel_id: int | None = None) -> list[str]:
         args = [
             self.config.claude_bin, "--print", "--output-format", "stream-json", "--verbose",
             "--permission-mode", self.permission_mode, f"--add-dir={self.config.attachment_dir}",
         ]
-        if self.session_id:
-            args += ["--resume", self.session_id]
+        session_id = self._session_ids.get(channel_id)
+        if session_id:
+            args += ["--resume", session_id]
         if self.model:
             args += ["--model", self.model]
         if self.effort:
@@ -514,8 +535,9 @@ class ClaudeRunner:
         await self._run_claude(channel, build_prompt(prompt, attachment_paths))
 
     async def _run_claude(self, channel, prompt: str) -> None:
+        channel_id = getattr(channel, "id", None)
         proc = await asyncio.create_subprocess_exec(
-            *self.claude_args(prompt), cwd=str(self.config.workdir), stdout=asyncio.subprocess.PIPE,
+            *self.claude_args(prompt, channel_id), cwd=str(self.config.workdir), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=STREAM_BUFFER_LIMIT,
         )
         self.current_proc = proc
@@ -555,7 +577,7 @@ class ClaudeRunner:
         stopped_by_user = proc.returncode is not None and proc.returncode < 0
         self.current_proc = None
         if last_session_id:
-            self.session_id = last_session_id
+            self._session_ids[channel_id] = last_session_id
         if stopped_by_user:
             return
         if proc.returncode != 0 and error_payload is None:
@@ -655,17 +677,22 @@ class AgentBridge:
         self._install_slash_commands()
 
     def _channel_prompt_for_agent(self, content: str) -> str | None:
-        """Return stripped prompt when an allowed shared-channel message targets this agent."""
-        text = content.strip()
+        """Return stripped prompt when an allowed shared-channel message targets
+        this agent. Match aliases only at the start of the message — never
+        anywhere in the body — so a worker reply that mentions another agent's
+        name in passing does not trigger that agent."""
+        text = content.lstrip()
+        if not text:
+            return None
         lowered = text.lower()
         mention = f"<@{self.client.user.id}>" if self.client.user else ""
         mention_nick = f"<@!{self.client.user.id}>" if self.client.user else ""
-        prefixes: set[str] = set()
-        for alias in self.config.aliases:
-            prefixes.update({f"{alias}:", f"{alias} only:", f"@{alias}:", f"@{alias}"})
-        for raw_prefix in [mention, mention_nick]:
+        for raw_prefix in (mention, mention_nick):
             if raw_prefix and text.startswith(raw_prefix):
                 return text[len(raw_prefix):].lstrip(" :—-\n")
+        prefixes: set[str] = set()
+        for alias in self.config.aliases:
+            prefixes.update({f"{alias}:", f"{alias} only:", f"@{alias}:", f"@{alias} "})
         for prefix in sorted(prefixes, key=len, reverse=True):
             if lowered.startswith(prefix):
                 return text[len(prefix):].lstrip(" :—-\n")
@@ -673,10 +700,24 @@ class AgentBridge:
 
     def _is_authorized_message(self, message: discord.Message) -> bool:
         is_dm = isinstance(message.channel, discord.DMChannel)
-        is_allowed_channel = getattr(message.channel, "id", None) in self.config.allowed_channel_ids
+        channel_id = getattr(message.channel, "id", None)
+        is_allowed_channel = channel_id in self.config.allowed_channel_ids
+        is_bot_only_channel = channel_id in self.config.bot_only_channel_ids
         is_allowed_user = message.author.id == self.config.allowed_user_id and not message.author.bot
-        is_allowed_bot = is_allowed_channel and message.author.bot and message.author.id in self.config.allowed_bot_user_ids
-        return (is_dm and is_allowed_user) or (is_allowed_channel and (is_allowed_user or is_allowed_bot))
+        is_allowed_bot = (
+            (is_allowed_channel or is_bot_only_channel)
+            and message.author.bot
+            and message.author.id in self.config.allowed_bot_user_ids
+        )
+        if is_dm:
+            return self.config.accept_dms and is_allowed_user
+        if is_bot_only_channel:
+            # Humans ignored entirely in this channel; only an allowlisted bot
+            # (e.g. the manager agent) may speak.
+            return is_allowed_bot
+        if is_allowed_channel:
+            return is_allowed_user or is_allowed_bot
+        return False
 
     def _install_events(self) -> None:
         @self.client.event
@@ -698,6 +739,13 @@ class AgentBridge:
                 if routed is None:
                     return
                 content = routed
+            # Pre-lock interception: a manager bot can issue
+            # "<alias>: __stop__" to abort the running turn without queueing
+            # behind the per-agent lock. Authorization is already enforced
+            # above (sender must be in allowed_bot_user_ids).
+            if message.author.bot and content.strip() == "__stop__":
+                await message.channel.send(await do_stop(self.runner))
+                return
             paths = await self.attachment_store.save(self.config.name, message)
             await self.handle(message.channel, content, paths)
 
@@ -709,7 +757,8 @@ class AgentBridge:
         async def slash_new(interaction: discord.Interaction):
             if interaction.user.id != self.config.allowed_user_id:
                 return await self._deny(interaction)
-            await interaction.response.send_message(await self.runner.new(), ephemeral=True)
+            channel_id = getattr(interaction.channel, "id", None)
+            await interaction.response.send_message(await self.runner.new(channel_id), ephemeral=True)
 
         @self.tree.command(name="stop", description="Abort the currently running backend turn")
         async def slash_stop(interaction: discord.Interaction):
@@ -721,7 +770,8 @@ class AgentBridge:
         async def slash_status(interaction: discord.Interaction):
             if interaction.user.id != self.config.allowed_user_id:
                 return await self._deny(interaction)
-            await interaction.response.send_message(self.runner.status(), ephemeral=True)
+            channel_id = getattr(interaction.channel, "id", None)
+            await interaction.response.send_message(self.runner.status(channel_id), ephemeral=True)
 
         @self.tree.command(name="help", description="Show bridge command help")
         async def slash_help(interaction: discord.Interaction):
@@ -731,6 +781,7 @@ class AgentBridge:
 
     async def handle(self, channel, content: str, attachment_paths: list[Path] | None = None) -> None:
         attachment_paths = attachment_paths or []
+        channel_id = getattr(channel, "id", None)
         stripped = content.strip()
         if not stripped and not attachment_paths:
             return
@@ -742,10 +793,10 @@ class AgentBridge:
             await channel.send(self.runner.help())
             return
         if cmd == "/status":
-            await channel.send(self.runner.status())
+            await channel.send(self.runner.status(channel_id))
             return
         if cmd == "/new":
-            await channel.send(await self.runner.new())
+            await channel.send(await self.runner.new(channel_id))
             return
         if cmd == "/stop":
             await channel.send(await do_stop(self.runner))

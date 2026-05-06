@@ -492,6 +492,47 @@ MEDIA:/absolute/path/to/image.png
 
 For shared Discord channels, set `<PREFIX>_ALLOWED_CHANNEL_IDS`, `<PREFIX>_ALLOWED_BOT_USER_IDS`, and `<PREFIX>_ALIASES`. Prefix messages like `luna: ...` or `claudette: ...` so only the targeted bot responds. DMs still route by allowlisted user ID.
 
+### Per-channel session isolation
+
+Each Discord channel gets its own Codex thread / Claude session. A user DM and a shared-channel conversation against the same worker do not share state. This makes it safe to drive the same worker from multiple places without context bleeding across them.
+
+### Manager-bot orchestration
+
+A third bot (an "orchestrator" or "manager") can drive the workers in a shared channel — for example, a higher-level agent that decomposes a user request into worker subtasks. The bridge ships three primitives for that pattern:
+
+- `<PREFIX>_BOT_ONLY_CHANNEL_IDS` — channels where the human user is ignored entirely; only senders in `<PREFIX>_ALLOWED_BOT_USER_IDS` may speak. The user can still DM the manager directly; the orchestration channel is the manager's workspace.
+- `<PREFIX>_ACCEPT_DMS=false` — worker bot ignores DMs entirely. Use this when only the manager bot should ever talk to the worker.
+- **`__stop__` from an authorized bot.** Any sender in `<PREFIX>_ALLOWED_BOT_USER_IDS` can post `<alias>: __stop__` (or `<@bot> __stop__`) and the bridge will abort the running turn before acquiring the per-agent lock. The worker's session state is preserved — the manager can immediately send a follow-up.
+
+Setup steps for an orchestrator bot called `manager` controlling two workers `worker_a` and `worker_b` in channel `<ORCH_CHANNEL>`:
+
+1. Create three Discord bot applications. Note each bot's user ID (Application ID in the Developer Portal). Invite all three to your server with permission to read and send messages in `<ORCH_CHANNEL>`.
+2. **Enable Message Content Intent** on the manager bot's app (Developer Portal → Bot → Privileged Gateway Intents). Free for personal-use bots in fewer than 100 servers. Without this, the manager will only see channel messages that @mention it; worker replies that just `@manager …` still work, but plain text replies will not be delivered to it.
+3. Configure each worker in this bridge:
+
+   ```env
+   WORKER_A_TOKEN=...
+   WORKER_A_BACKEND=codex            # or claude
+   WORKER_A_ALLOWED_USER_ID=<your-discord-user-id>
+   WORKER_A_ALIASES=worker_a
+   WORKER_A_BOT_ONLY_CHANNEL_IDS=<ORCH_CHANNEL>
+   WORKER_A_ALLOWED_BOT_USER_IDS=<MANAGER_BOT_USER_ID>
+   WORKER_A_ACCEPT_DMS=false         # workers only respond to manager
+   ```
+
+   Repeat for `WORKER_B_*`.
+4. Run the manager bot in whatever process you like (it can be another instance of `unified_bridge.py`, an OpenClaw Discord channel, a custom Python bot — whatever produces Discord messages on its bot account). The manager addresses workers by alias prefix at the start of a message:
+
+   ```
+   worker_a: read foo.py and summarize the design
+   worker_b: implement the plan worker_a just produced
+   worker_a: __stop__
+   ```
+
+   Workers reply in the same channel. The manager reads those replies (subject to its Message Content Intent) and decides what to do next.
+
+The manager's prompt should enforce its own loop guards (max hops per top-level user request, an explicit "done" signal, error/timeout handling). The bridge does not enforce those — it only provides authorization, isolation, and the `__stop__` primitive.
+
 Manual run:
 
 ```bash
