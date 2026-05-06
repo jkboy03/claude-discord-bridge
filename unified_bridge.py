@@ -941,16 +941,6 @@ class AgentBridge:
                 return await self._deny(interaction)
             await interaction.response.send_message(self.runner.help(), ephemeral=True)
 
-        @self.tree.command(name="model", description="Set the backend model for next turns")
-        @app_commands.describe(name="Model name (e.g. sonnet, gpt-5.5). Use 'default' to clear.")
-        async def slash_model(interaction: discord.Interaction, name: str):
-            if interaction.user.id != self.config.allowed_user_id:
-                return await self._deny(interaction)
-            new_model = None if name.strip().lower() in {"", "default"} else name.strip()
-            self.runner.model = new_model
-            label = self.runner.model or "(default)"
-            await interaction.response.send_message(f"_model: {label}_", ephemeral=True)
-
         # /tools, /context, /effort apply to both backends.
         tools_choices = [
             app_commands.Choice(name="on", value="on"),
@@ -976,6 +966,24 @@ class AgentBridge:
             await interaction.response.send_message(self.runner._usage_block(channel_id), ephemeral=True)
 
         if self.config.backend == "codex":
+            codex_model_choices = [
+                app_commands.Choice(name="gpt-5.5", value="gpt-5.5"),
+                app_commands.Choice(name="gpt-5.4", value="gpt-5.4"),
+                app_commands.Choice(name="gpt-5.3", value="gpt-5.3"),
+                app_commands.Choice(name="default (clear override)", value="default"),
+            ]
+
+            @self.tree.command(name="model", description="Pick the Codex model for next turns")
+            @app_commands.choices(name=codex_model_choices)
+            async def slash_model_codex(interaction: discord.Interaction, name: app_commands.Choice[str]):
+                if interaction.user.id != self.config.allowed_user_id:
+                    return await self._deny(interaction)
+                self.runner.model = None if name.value == "default" else name.value
+                await interaction.response.send_message(
+                    f"_model: {self.runner.model or '(default)'}_",
+                    ephemeral=True,
+                )
+
             codex_effort_choices = [
                 app_commands.Choice(name=v, value=v)
                 for v in ("low", "medium", "high", "xhigh", "default")
@@ -1042,6 +1050,24 @@ class AgentBridge:
                     await self.runner._run_codex(interaction.channel, prompt or "", review=True)
 
         else:  # claude backend
+            claude_model_choices = [
+                app_commands.Choice(name="opus", value="opus"),
+                app_commands.Choice(name="sonnet", value="sonnet"),
+                app_commands.Choice(name="haiku", value="haiku"),
+                app_commands.Choice(name="default (clear override)", value="default"),
+            ]
+
+            @self.tree.command(name="model", description="Pick the Claude model for next turns")
+            @app_commands.choices(name=claude_model_choices)
+            async def slash_model_claude(interaction: discord.Interaction, name: app_commands.Choice[str]):
+                if interaction.user.id != self.config.allowed_user_id:
+                    return await self._deny(interaction)
+                self.runner.model = None if name.value == "default" else name.value
+                await interaction.response.send_message(
+                    f"_model: {self.runner.model or '(default)'}_",
+                    ephemeral=True,
+                )
+
             claude_effort_choices = [
                 app_commands.Choice(name=v, value=v)
                 for v in ("low", "medium", "high", "xhigh", "max", "default")
