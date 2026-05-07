@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -28,6 +29,10 @@ load_dotenv(Path(__file__).parent / ".env")
 DISCORD_LIMIT = 1900
 STREAM_BUFFER_LIMIT = 16 * 1024 * 1024
 DISCORD_FILE_LIMIT = 24 * 1024 * 1024
+DEFAULT_IDLE_TIMEOUT_SECONDS = 600.0
+DEFAULT_TURN_TIMEOUT_SECONDS = 0.0
+PROCESS_STOP_TIMEOUT_SECONDS = 3.0
+STDERR_READ_TIMEOUT_SECONDS = 2.0
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 SENDABLE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp",
@@ -45,6 +50,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_seconds(raw: str, default: float) -> float:
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(0.0, value)
 
 
 def _split_ids(raw: str) -> set[int]:
@@ -208,6 +223,118 @@ async def send_text(channel, text: str, *, mention_prefix: str = "") -> None:
         await channel.send(file=discord.File(path))
 
 
+class _MentionDeferrer:
+    """Hold the most-recent assistant message of a streamed turn so that
+    only the FINAL message carries the manager-bot @mention prefix.
+
+    Intermediate progress messages stream live (good for transparency) but
+    do not trigger Vivi. When the stream ends, ``finalize()`` flushes the
+    held message with the mention, ending the worker's turn from Vivi's
+    perspective with a single ping.
+    """
+
+    def __init__(self, channel, mention_prefix: str) -> None:
+        self.channel = channel
+        self.mention_prefix = mention_prefix
+        self._pending: str | None = None
+
+    async def push(self, text: str) -> None:
+        if self._pending is not None:
+            await send_text(self.channel, self._pending, mention_prefix="")
+        self._pending = text
+
+    async def finalize(self, suffix: str = "") -> None:
+        if self._pending is None and not suffix.strip():
+            return
+        text = self._pending or ""
+        if suffix.strip():
+            text = f"{text}\n\n{suffix.strip()}" if text else suffix.strip()
+        self._pending = None
+        await send_text(self.channel, text, mention_prefix=self.mention_prefix)
+
+
+class BackendRunTimeout(Exception):
+    def __init__(self, kind: str, seconds: float) -> None:
+        self.kind = kind
+        self.seconds = seconds
+        super().__init__(f"{kind} timeout after {seconds:g}s")
+
+
+def _turn_deadline(config: "AgentConfig") -> float | None:
+    if config.turn_timeout_seconds <= 0:
+        return None
+    return time.monotonic() + config.turn_timeout_seconds
+
+
+async def _readline_with_watchdog(stream, config: "AgentConfig", deadline: float | None) -> bytes:
+    timeouts: list[tuple[str, float]] = []
+    if config.idle_timeout_seconds > 0:
+        timeouts.append(("idle", config.idle_timeout_seconds))
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BackendRunTimeout("wall-time", config.turn_timeout_seconds)
+        timeouts.append(("wall-time", remaining))
+    if not timeouts:
+        return await stream.readline()
+
+    kind, timeout = min(timeouts, key=lambda item: item[1])
+    try:
+        return await asyncio.wait_for(stream.readline(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise BackendRunTimeout("wall-time", config.turn_timeout_seconds) from exc
+        raise BackendRunTimeout(kind, timeout) from exc
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+        return
+    except asyncio.TimeoutError:
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def _wait_for_process_exit(proc: asyncio.subprocess.Process) -> bool:
+    if proc.returncode is not None:
+        return False
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+        return False
+    except asyncio.TimeoutError:
+        await _terminate_process(proc)
+        return True
+
+
+async def _read_stderr(proc: asyncio.subprocess.Process) -> bytes:
+    if proc.stderr is None:
+        return b""
+    try:
+        return await asyncio.wait_for(proc.stderr.read(), timeout=STDERR_READ_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return b""
+
+
+def _timeout_warning(config: "AgentConfig", timeout: BackendRunTimeout) -> str:
+    label = "idle" if timeout.kind == "idle" else "wall-time"
+    return (
+        f"_warning: {config.name} backend {label} timeout after {timeout.seconds:g}s; "
+        "subprocess was terminated. Any known session/thread id was preserved._"
+    )
+
+
 class AttachmentStore:
     """Shared inbound attachment handling for all configured agents."""
 
@@ -278,6 +405,8 @@ class AgentConfig:
     default_search: bool = False
     claude_permission_mode: str = "bypassPermissions"
     aliases: set[str] = field(default_factory=set)
+    idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS
+    turn_timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls, name: str, *, shared_attachment_dir: Path | None = None) -> "AgentConfig":
@@ -332,6 +461,8 @@ class AgentConfig:
             default_search=_env_bool(f"{prefix}_DEFAULT_SEARCH", False),
             claude_permission_mode=env("CLAUDE_PERMISSION_MODE", "bypassPermissions") or "bypassPermissions",
             aliases={x.lower() for x in (env("ALIASES") or name).replace(",", " ").split() if x.strip()},
+            idle_timeout_seconds=_parse_seconds(env("IDLE_TIMEOUT_SECONDS"), DEFAULT_IDLE_TIMEOUT_SECONDS),
+            turn_timeout_seconds=_parse_seconds(env("TURN_TIMEOUT_SECONDS"), DEFAULT_TURN_TIMEOUT_SECONDS),
         )
 
 
@@ -453,6 +584,7 @@ class CodexRunner:
     async def _run_codex(self, channel, prompt: str, *, review: bool = False, image_paths: list[Path] | None = None) -> None:
         channel_id = getattr(channel, "id", None)
         mention_prefix = self._mention_prefix_for(channel_id)
+        deferrer = _MentionDeferrer(channel, mention_prefix)
         rendered = prompt if review else self._compose_prompt(prompt)
         args = self.review_args(rendered) if review else self.codex_args(rendered, channel_id, image_paths)
         proc = await asyncio.create_subprocess_exec(
@@ -462,11 +594,17 @@ class CodexRunner:
         self.current_proc = proc
         last_thread_id: str | None = None
         error_payload: str | None = None
+        timed_out: BackendRunTimeout | None = None
+        deadline = _turn_deadline(self.config)
         async with channel.typing():
             assert proc.stdout is not None
             while True:
                 try:
-                    line_bytes = await proc.stdout.readline()
+                    line_bytes = await _readline_with_watchdog(proc.stdout, self.config, deadline)
+                except BackendRunTimeout as e:
+                    timed_out = e
+                    await _terminate_process(proc)
+                    break
                 except asyncio.LimitOverrunError as e:
                     await proc.stdout.readexactly(e.consumed)
                     try:
@@ -490,25 +628,25 @@ class CodexRunner:
                     if itype == "agent_message" and etype == "item.completed":
                         text = (item.get("text") or "").strip()
                         if text:
-                            await send_text(channel, text, mention_prefix=mention_prefix)
+                            await deferrer.push(text)
                     elif self.show_tools and itype != "agent_message":
                         await channel.send(f"_> {format_codex_item(item)}_")
                 elif etype == "turn.completed" and isinstance(event.get("usage"), dict):
                     self._last_usage[channel_id] = event["usage"]
                 elif etype == "error":
                     error_payload = event.get("message") or event.get("error") or "unknown error"
-        stderr_data = b""
-        if proc.stderr is not None:
-            try:
-                stderr_data = await asyncio.wait_for(proc.stderr.read(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        await proc.wait()
+            await deferrer.finalize(_timeout_warning(self.config, timed_out) if timed_out else "")
+        wait_timed_out = await _wait_for_process_exit(proc)
+        stderr_data = await _read_stderr(proc)
         stopped_by_user = proc.returncode is not None and proc.returncode < 0
         self.current_proc = None
         if last_thread_id and not review:
             self._thread_ids[channel_id] = last_thread_id
-        if stopped_by_user:
+        if timed_out:
+            return
+        if wait_timed_out and error_payload is None:
+            error_payload = "codex stdout ended but process did not exit; subprocess was terminated"
+        elif stopped_by_user:
             return
         if proc.returncode != 0 and error_payload is None:
             tail = stderr_data.decode(errors="replace").strip().splitlines()[-3:]
@@ -685,6 +823,7 @@ class ClaudeRunner:
     async def _run_claude(self, channel, prompt: str) -> None:
         channel_id = getattr(channel, "id", None)
         mention_prefix = self._mention_prefix_for(channel_id)
+        deferrer = _MentionDeferrer(channel, mention_prefix)
         proc = await asyncio.create_subprocess_exec(
             *self.claude_args(prompt, channel_id), cwd=str(self.config.workdir), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=STREAM_BUFFER_LIMIT,
@@ -692,9 +831,27 @@ class ClaudeRunner:
         self.current_proc = proc
         last_session_id: str | None = None
         error_payload: str | None = None
+        timed_out: BackendRunTimeout | None = None
+        deadline = _turn_deadline(self.config)
         async with channel.typing():
             assert proc.stdout is not None
-            async for line_bytes in proc.stdout:
+            while True:
+                try:
+                    line_bytes = await _readline_with_watchdog(proc.stdout, self.config, deadline)
+                except BackendRunTimeout as e:
+                    timed_out = e
+                    await _terminate_process(proc)
+                    break
+                except asyncio.LimitOverrunError as e:
+                    await proc.stdout.readexactly(e.consumed)
+                    try:
+                        await proc.stdout.readuntil(b"\n")
+                    except (asyncio.LimitOverrunError, asyncio.IncompleteReadError):
+                        pass
+                    await channel.send(f"_skipped one Claude JSONL event larger than {STREAM_BUFFER_LIMIT // (1024 * 1024)} MB_")
+                    continue
+                if not line_bytes:
+                    break
                 try:
                     event = json.loads(line_bytes.decode().strip())
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -709,7 +866,7 @@ class ClaudeRunner:
                         if btype == "text":
                             text = (block.get("text") or "").strip()
                             if text:
-                                await send_text(channel, text, mention_prefix=mention_prefix)
+                                await deferrer.push(text)
                         elif btype == "tool_use" and self.show_tools:
                             await channel.send(f"_↳ {format_claude_tool(block.get('name', '?'), block.get('input', {}) or {})}_")
                 elif etype == "result":
@@ -725,18 +882,18 @@ class ClaudeRunner:
                             pass
                     if event.get("is_error"):
                         error_payload = event.get("result") or "(unknown error)"
-        stderr_data = b""
-        if proc.stderr is not None:
-            try:
-                stderr_data = await asyncio.wait_for(proc.stderr.read(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        await proc.wait()
+            await deferrer.finalize(_timeout_warning(self.config, timed_out) if timed_out else "")
+        wait_timed_out = await _wait_for_process_exit(proc)
+        stderr_data = await _read_stderr(proc)
         stopped_by_user = proc.returncode is not None and proc.returncode < 0
         self.current_proc = None
         if last_session_id:
             self._session_ids[channel_id] = last_session_id
-        if stopped_by_user:
+        if timed_out:
+            return
+        if wait_timed_out and error_payload is None:
+            error_payload = "claude stdout ended but process did not exit; subprocess was terminated"
+        elif stopped_by_user:
             return
         if proc.returncode != 0 and error_payload is None:
             tail = stderr_data.decode(errors="replace").strip().splitlines()[-3:]
@@ -813,12 +970,7 @@ async def do_stop(runner: BackendRunner) -> str:
     if proc is None or proc.returncode is not None:
         return "_no turn running_"
     try:
-        proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=3.0)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+        await _terminate_process(proc)
         return "_stopped - session preserved, send a new prompt to continue_"
     except ProcessLookupError:
         return "_turn already finished_"

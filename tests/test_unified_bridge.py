@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -45,6 +47,50 @@ class Message:
     def __init__(self, msg_id=123, attachments=None):
         self.id = msg_id
         self.attachments = attachments or []
+
+
+def event_line(payload: dict) -> bytes:
+    return (json.dumps(payload) + "\n").encode()
+
+
+class LineThenHangStream:
+    def __init__(self, lines: list[bytes]):
+        self.lines = list(lines)
+
+    async def readline(self):
+        if self.lines:
+            return self.lines.pop(0)
+        await asyncio.sleep(60)
+        return b""
+
+
+class EmptyStream:
+    async def read(self, _n=-1):
+        return b""
+
+
+class HangingProc:
+    def __init__(self, lines: list[bytes]):
+        self.stdout = LineThenHangStream(lines)
+        self.stderr = EmptyStream()
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        if self.killed:
+            self.returncode = -9
+        elif self.terminated:
+            self.returncode = -15
+        else:
+            await asyncio.sleep(60)
+        return self.returncode
 
 
 def clear_agent_env(monkeypatch):
@@ -389,6 +435,58 @@ class TestSharedChannelRouting:
         await ub.send_text(ch, "hello world")
 
         assert ch.sent[0] == "hello world"
+
+    async def test_claude_idle_timeout_flushes_pending_final_with_manager_mention(self, monkeypatch, tmp_path):
+        cfg = TestRunnerArgsAndRouting().config(tmp_path, "claude")
+        cfg.bot_only_channel_ids = {555}
+        cfg.allowed_bot_user_ids = {9001}
+        cfg.idle_timeout_seconds = 0.01
+        runner = ub.ClaudeRunner(cfg)
+        proc = HangingProc([
+            event_line({"type": "system", "subtype": "init", "session_id": "sess-1"}),
+            event_line({"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "draft final report"}],
+            }}),
+        ])
+
+        async def fake_create(*_args, **_kwargs):
+            return proc
+
+        monkeypatch.setattr(ub.asyncio, "create_subprocess_exec", fake_create)
+        ch = Channel(channel_id=555)
+
+        await asyncio.wait_for(runner._run_claude(ch, "hi"), timeout=1.0)
+
+        assert proc.terminated is True
+        assert runner.current_proc is None
+        assert runner._session_ids[555] == "sess-1"
+        assert len(ch.sent) == 1
+        assert ch.sent[0].startswith("<@9001>")
+        assert "draft final report" in ch.sent[0]
+        assert "idle timeout" in ch.sent[0]
+
+    async def test_codex_idle_timeout_sends_mentioned_warning_without_pending_text(self, monkeypatch, tmp_path):
+        cfg = TestRunnerArgsAndRouting().config(tmp_path, "codex")
+        cfg.bot_only_channel_ids = {555}
+        cfg.allowed_bot_user_ids = {9001}
+        cfg.idle_timeout_seconds = 0.01
+        runner = ub.CodexRunner(cfg)
+        proc = HangingProc([event_line({"type": "thread.started", "thread_id": "thread-1"})])
+
+        async def fake_create(*_args, **_kwargs):
+            return proc
+
+        monkeypatch.setattr(ub.asyncio, "create_subprocess_exec", fake_create)
+        ch = Channel(channel_id=555)
+
+        await asyncio.wait_for(runner._run_codex(ch, "hi"), timeout=1.0)
+
+        assert proc.terminated is True
+        assert runner.current_proc is None
+        assert runner._thread_ids[555] == "thread-1"
+        assert len(ch.sent) == 1
+        assert ch.sent[0].startswith("<@9001>")
+        assert "idle timeout" in ch.sent[0]
 
     def test_accept_dms_false_ignores_dms(self, tmp_path):
         bridge = self._bridge(tmp_path, accept_dms=False)

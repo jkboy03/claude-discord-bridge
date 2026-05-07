@@ -630,6 +630,8 @@ The bridge ships four authorization/isolation primitives that make this pattern 
 
 Auto-mention prefix: when a worker replies in a `BOT_ONLY_CHANNEL_IDS` channel, the bridge automatically prepends `<@manager_id>` to the first chunk of the reply. This guarantees Discord delivers the full message content to the manager via the @mention path even if the manager's bot doesn't have Message Content Intent.
 
+Worker final-report behavior: in bot-only orchestration channels, streamed assistant messages are visible as progress, but the bridge defers the manager @mention until the final assistant message of the backend turn. If a worker needs to return more detail than fits in one Discord message, have it write the full report to a markdown file in its project or notes directory and keep the final in-channel reply short with a pointer such as `Full detail: /path/to/report.md`. This keeps the manager-triggering mention in one concise message instead of spreading the actionable summary across chunks.
+
 #### Setup for manager + two workers
 
 Assume:
@@ -685,7 +687,7 @@ The bridge provides authorization and the `__stop__` primitive. It does **not** 
 
 - A step budget (e.g. max 10 worker hops per top-level user request).
 - A "done" signal (e.g. a final reply that starts with `done:`).
-- A per-step timeout (e.g. issue `__stop__` if a worker doesn't reply in 5 minutes).
+- A per-step orchestration timeout (e.g. issue `__stop__` if a worker doesn't complete a delegated step in your policy window). The bridge also has subprocess idle/wall-time watchdogs, but those are backend safety rails, not a substitute for manager planning.
 - Failure handling (retry once, switch worker, or escalate).
 - Avoiding bot-to-bot loops (don't react to your own posts; always serial across workers).
 
@@ -743,6 +745,8 @@ Models, efforts, and modes are *also* settable via the `<PREFIX>_DEFAULT_MODEL` 
 | `<PREFIX>_ALLOWED_BOT_USER_IDS` | | both | Other bots whose messages this agent honors in allowed channels. |
 | `<PREFIX>_BOT_ONLY_CHANNEL_IDS` | | both | Channels where the human user is IGNORED — only `ALLOWED_BOT_USER_IDS` senders are processed. |
 | `<PREFIX>_ACCEPT_DMS` | | both | `true`/`false`. Default `true`. Set `false` so a worker only responds to its manager. |
+| `<PREFIX>_IDLE_TIMEOUT_SECONDS` | | both | Max stdout silence from the backend subprocess before the bridge terminates it and sends a final warning. Default `600`. Set `0` to disable. |
+| `<PREFIX>_TURN_TIMEOUT_SECONDS` | | both | Optional total wall-time cap for one backend turn. Default `0` (disabled). On timeout the bridge terminates the subprocess and sends a final warning. |
 
 ### Operational details
 
@@ -751,6 +755,8 @@ Models, efforts, and modes are *also* settable via the `<PREFIX>_DEFAULT_MODEL` 
 **Outbound files.** Either backend can have a worker print `FILE:/abs/path/file.md` or `MEDIA:/abs/path/image.png` on its own line. The bridge picks those up and uploads the file to the same Discord channel.
 
 **Per-channel sessions.** Each Discord channel keeps a separate backend session (Codex thread / Claude `session_id`). DM and channel conversations don't share context. `/new` only resets the current channel. Across orchestrations or across topics, you get clean state.
+
+**Timeouts and stop behavior.** `/stop` and bot-to-bot `__stop__` terminate the running backend subprocess and preserve the saved session/thread ID. The idle watchdog does the same automatically when a backend stops emitting stdout for `<PREFIX>_IDLE_TIMEOUT_SECONDS`; if a final assistant message was pending, the bridge flushes it with the manager @mention and appends a timeout warning. If there was no pending assistant text, the warning itself is sent with the manager @mention. If `<PREFIX>_TURN_TIMEOUT_SECONDS` is set, the same behavior applies when the whole turn exceeds that wall-clock cap.
 
 **Logging.** When run via the systemd unit, all stdout/stderr goes to journald. Tail with:
 ```bash
