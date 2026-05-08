@@ -298,13 +298,64 @@ def split_at_boundary(text: str, max_size: int = DISCORD_LIMIT) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
+_last_send_at: dict[int, float] = {}
+_MIN_SEND_INTERVAL = 0.4
+
+
+async def _safe_send(target, content: str, *, max_attempts: int = 5) -> None:
+    """channel.send with per-channel throttle + retry on Discord 429.
+
+    discord.py auto-retries per-bucket 429s but NOT code 40062
+    ("Service resource is being rate limited") — those bubble up as
+    raw HTTPException and crash the turn. We catch, parse retry_after
+    from the response body, sleep, and retry.
+    """
+    now = asyncio.get_event_loop().time()
+    last = _last_send_at.get(target.id, 0.0)
+    gap = _MIN_SEND_INTERVAL - (now - last)
+    if gap > 0:
+        await asyncio.sleep(gap)
+
+    for attempt in range(max_attempts):
+        try:
+            await target.send(content)
+            _last_send_at[target.id] = asyncio.get_event_loop().time()
+            return
+        except discord.HTTPException as e:
+            if e.status != 429 or attempt == max_attempts - 1:
+                raise
+            delay: float | None = None
+            try:
+                body = json.loads(e.text) if isinstance(e.text, str) else {}
+                ra = body.get("retry_after") if isinstance(body, dict) else None
+                if isinstance(ra, (int, float)):
+                    delay = float(ra)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            if delay is None:
+                resp = getattr(e, "response", None)
+                if resp is not None:
+                    try:
+                        delay = float(resp.headers.get("Retry-After") or 0)
+                    except (TypeError, ValueError):
+                        delay = None
+            if not delay or delay <= 0:
+                delay = 5.0
+            print(
+                f"[bridge] discord 429 (code={getattr(e, 'code', '?')}); "
+                f"sleeping {delay:.1f}s then retry {attempt + 2}/{max_attempts}",
+                file=sys.stderr,
+                flush=True,
+            )
+            await asyncio.sleep(delay + 0.5)
+            _last_send_at[target.id] = asyncio.get_event_loop().time()
+
+
 async def send_text(channel, text: str) -> None:
     """Send text as plain Discord markdown, paragraph-aware chunked."""
     chunks = split_at_boundary(text)
-    for i, chunk in enumerate(chunks):
-        if i > 0:
-            await asyncio.sleep(0.4)
-        await channel.send(chunk)
+    for chunk in chunks:
+        await _safe_send(channel, chunk)
 
 
 def format_tool_call(name: str, inp: dict) -> str:
@@ -354,7 +405,7 @@ async def run_claude_turn(channel, prompt: str) -> None:
                     await proc.stdout.readuntil(b"\n")
                 except (asyncio.LimitOverrunError, asyncio.IncompleteReadError):
                     pass
-                await channel.send(
+                await _safe_send(channel,
                     f"_⚠ skipped one stream-json event larger than "
                     f"{STREAM_BUFFER_LIMIT // (1024 * 1024)} MB_"
                 )
@@ -395,7 +446,7 @@ async def run_claude_turn(channel, prompt: str) -> None:
                     elif btype == "tool_use" and state.show_tools:
                         name = block.get("name", "?")
                         inp = block.get("input", {}) or {}
-                        await channel.send(f"_↳ {format_tool_call(name, inp)}_")
+                        await _safe_send(channel,f"_↳ {format_tool_call(name, inp)}_")
 
             # Final result event (also has session_id; use it as authoritative).
             elif etype == "result":
@@ -428,7 +479,7 @@ async def run_claude_turn(channel, prompt: str) -> None:
             proc.returncode, " | ".join(tail) if tail else "(no stderr)",
         )
     if error_payload:
-        await channel.send(f"_⚠ {error_payload}_")
+        await _safe_send(channel,f"_⚠ {error_payload}_")
 
 
 @client.event
@@ -585,10 +636,10 @@ async def on_message(message: discord.Message) -> None:
     pre = stripped[1:] if stripped.startswith(("!", "/")) else ""
     pre_cmd = pre.split(maxsplit=1)[0].lower() if pre else ""
     if pre_cmd == "stop":
-        await channel.send(await _do_stop())
+        await _safe_send(channel,await _do_stop())
         return
     if pre_cmd in ("exit", "quit"):
-        await channel.send(
+        await _safe_send(channel,
             "_/exit and /quit are no-ops in the bridge — they won't kill the "
             "bot or any claude session. use /stop to abort the current turn._"
         )
@@ -598,7 +649,7 @@ async def on_message(message: discord.Message) -> None:
         try:
             await _handle(channel, content)
         except Exception as e:
-            await channel.send(f"_bridge error: {type(e).__name__}: {e}_")
+            await _safe_send(channel,f"_bridge error: {type(e).__name__}: {e}_")
             raise
 
 
@@ -619,48 +670,48 @@ async def _handle(channel, content: str) -> None:
     arg = head[1].strip() if len(head) > 1 else ""
 
     if cmd in ("/help",):
-        await channel.send(HELP_TEXT)
+        await _safe_send(channel,HELP_TEXT)
         return
     if cmd in ("/status",):
-        await channel.send(_status_block())
+        await _safe_send(channel,_status_block())
         return
     if cmd in ("/context",):
-        await channel.send(_context_block())
+        await _safe_send(channel,_context_block())
         return
     if cmd in ("/new",):
         state.session_id = None
-        await channel.send("_new session — next prompt starts fresh_")
+        await _safe_send(channel,"_new session — next prompt starts fresh_")
         return
     if cmd in ("/auto",):
         if arg.lower() in ("", "on"):
             state.permission_mode = "bypassPermissions"
-            await channel.send("_auto mode on_")
+            await _safe_send(channel,"_auto mode on_")
         elif arg.lower() == "off":
             state.permission_mode = "default"
-            await channel.send("_auto mode off_")
+            await _safe_send(channel,"_auto mode off_")
         else:
-            await channel.send("_usage: /auto on  |  /auto off_")
+            await _safe_send(channel,"_usage: /auto on  |  /auto off_")
         return
     if cmd in ("/model",):
         state.model = arg or None
-        await channel.send(f"_model: {state.model or '(default)'}_")
+        await _safe_send(channel,f"_model: {state.model or '(default)'}_")
         return
     if cmd in ("/effort",):
         if arg and arg not in ("low", "medium", "high", "xhigh", "max"):
-            await channel.send("_effort must be: low, medium, high, xhigh, max_")
+            await _safe_send(channel,"_effort must be: low, medium, high, xhigh, max_")
             return
         state.effort = arg or None
-        await channel.send(f"_effort: {state.effort or '(default)'}_")
+        await _safe_send(channel,f"_effort: {state.effort or '(default)'}_")
         return
     if cmd in ("/tools",):
         if arg.lower() in ("", "on"):
             state.show_tools = True
-            await channel.send("_tool notifications on_")
+            await _safe_send(channel,"_tool notifications on_")
         elif arg.lower() == "off":
             state.show_tools = False
-            await channel.send("_tool notifications off_")
+            await _safe_send(channel,"_tool notifications off_")
         else:
-            await channel.send("_usage: /tools on  |  /tools off_")
+            await _safe_send(channel,"_usage: /tools on  |  /tools off_")
         return
 
     # Anything else (including Claude Code skill commands like /init, /review,
