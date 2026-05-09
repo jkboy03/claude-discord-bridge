@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import discord
@@ -358,6 +359,38 @@ async def send_text(channel, text: str) -> None:
         await _safe_send(channel, chunk)
 
 
+@asynccontextmanager
+async def _safe_typing(channel):
+    """channel.typing() but typing failures are swallowed (typing is cosmetic).
+
+    discord.py 2.x's Typing.__aenter__ awaits send_typing() synchronously,
+    so a 429 (incl. code 40062 on the typing bucket) crashes the entire
+    turn. Typing pings are independent of message-send rate limits and get
+    throttled hard by Discord's anti-spam — we don't want a missing typing
+    indicator to take down the turn.
+    """
+    typing = channel.typing()
+    entered = False
+    try:
+        try:
+            await typing.__aenter__()
+            entered = True
+        except discord.HTTPException as e:
+            print(
+                f"[bridge] typing skipped (status={e.status} "
+                f"code={getattr(e, 'code', '?')}); turn continues without indicator",
+                file=sys.stderr,
+                flush=True,
+            )
+        yield
+    finally:
+        if entered:
+            try:
+                await typing.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+
 def format_tool_call(name: str, inp: dict) -> str:
     """One-line summary of a tool call for an inline notification."""
     if name == "Bash":
@@ -391,7 +424,7 @@ async def run_claude_turn(channel, prompt: str) -> None:
     error_payload: str | None = None
     stopped_by_user = False
 
-    async with channel.typing():
+    async with _safe_typing(channel):
         assert proc.stdout is not None
         while True:
             try:
@@ -620,6 +653,13 @@ async def _do_stop() -> str:
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
+    print(
+        f"[bridge] DM in: author={message.author.id} "
+        f"channel_type={type(message.channel).__name__} "
+        f"len={len(message.content)}",
+        file=sys.stderr,
+        flush=True,
+    )
     if not isinstance(message.channel, discord.DMChannel):
         return
     if message.author.id != ALLOWED_USER_ID:
